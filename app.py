@@ -40,14 +40,102 @@ def read_uploaded_table(uploaded_file):
 def normalize_text(text: object) -> str:
     if not isinstance(text, str):
         return ""
-    s = unicodedata.normalize("NFKC", text).lower()
+    s = unicodedata.normalize("NFKC", text)
+    s = "".join(
+        ch
+        for ch in s
+        if not (unicodedata.category(ch) in {"Cf", "Cc"} and ch not in {"\n", "\t", "\r"})
+    )
+    s = s.lower()
     s = re.sub(r"https?://\\S+|www\\.\\S+", " ", s)
     s = re.sub(r"@([\\w_]+)", " ", s)
     s = re.sub(r"#([\\w_]+)", r" \\1 ", s)
     s = re.sub(r"[\\r\\n\\t]+", " ", s)
     s = re.sub(r"[^a-z0-9\\u4e00-\\u9fff ]+", " ", s)
     s = re.sub(r"\\s{2,}", " ", s).strip()
+    s = re.sub(r"\\blas\\s+vegas\\b", "las_vegas", s)
+    s = re.sub(r"\\bcasa\\s+playa\\b", "casa_playa", s)
     return s
+
+
+def demojize_if_available(text: str) -> str:
+    try:
+        import emoji
+    except Exception:
+        return text
+
+    try:
+        s = emoji.demojize(text, delimiters=(" ", " "))
+        s = s.replace("_", " ")
+        replacements = {
+            "party popper": "庆祝",
+            "red heart": "爱",
+            "blue heart": "爱",
+            "green heart": "爱",
+            "purple heart": "爱",
+            "sparkling heart": "爱",
+            "smiling face": "开心",
+            "grinning face": "开心",
+            "face with tears of joy": "大笑",
+            "loudly crying face": "难过",
+            "thumbs up": "点赞",
+            "clapping hands": "鼓掌",
+            "fire": "火爆",
+            "hundred points": "满分",
+        }
+        for k, v in replacements.items():
+            s = re.sub(rf"\\b{k}\\b", f" {v} ", s)
+        s = re.sub(r"\\s{2,}", " ", s).strip()
+        return s
+    except Exception:
+        return text
+
+
+_COMMON_EN_VERBS = {
+    "be","am","is","are","was","were","been","being",
+    "have","has","had","having",
+    "do","does","did","doing",
+    "can","could","may","might","must","shall","should","will","would",
+    "go","goes","went","gone","going",
+    "get","gets","got","getting",
+    "make","makes","made","making",
+    "say","says","said","saying",
+    "see","sees","saw","seen","seeing",
+    "know","knows","knew","known","knowing",
+    "think","thinks","thought","thinking",
+    "take","takes","took","taken","taking",
+    "come","comes","came","coming",
+    "use","uses","used","using",
+    "need","needs","needed","needing",
+    "want","wants","wanted","wanting",
+    "like","likes","liked","liking",
+    "love","loves","loved","loving",
+    "try","tries","tried","trying",
+    "work","works","worked","working",
+    "play","plays","played","playing",
+    "stay","stays","stayed","staying",
+    "look","looks","looked","looking",
+    "feel","feels","felt","feeling",
+    "find","finds","found","finding",
+    "keep","keeps","kept","keeping",
+    "put","puts","putting",
+    "let","lets","letting",
+}
+
+
+def keep_nouns_adjs_heuristic(tokens: List[str]) -> List[str]:
+    out = []
+    for t in tokens:
+        if not t:
+            continue
+        if t in _COMMON_EN_VERBS:
+            continue
+        if t.endswith("ing") and len(t) >= 6:
+            continue
+        if t.endswith("ed") and len(t) >= 6:
+            continue
+        out.append(t)
+    return out
 
 
 def _zh_char_ngrams(s: str, n: int) -> List[str]:
@@ -64,7 +152,7 @@ def tokenize(text: str, language: Literal["en", "zh", "mixed"] = "mixed") -> Lis
         return []
     tokens: List[str] = []
     if language in {"en", "mixed"}:
-        tokens.extend(re.findall(r"[a-z]{3,25}", text))
+        tokens.extend(re.findall(r"[a-z_]{3,35}", text))
         tokens.extend(re.findall(r"\\d{2,}", text))
     if language in {"zh", "mixed"}:
         zh_seqs = re.findall(r"[\\u4e00-\\u9fff]{2,}", text)
@@ -96,6 +184,9 @@ def preprocess_texts(
     texts: List[str],
     extra_stopwords: List[str] | None = None,
     language: Literal["auto", "en", "zh", "mixed"] = "auto",
+    emoji_to_words: bool = True,
+    min_token_len: int = 4,
+    keep_nouns_adjs_only: bool = False,
 ) -> Tuple[List[List[str]], List[str], Literal["en", "zh", "mixed"]]:
     try:
         from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
@@ -127,8 +218,24 @@ def preprocess_texts(
     tokens = []
     joined = []
     for t in texts:
-        n = normalize_text(t)
+        raw = demojize_if_available(str(t)) if emoji_to_words else str(t)
+        n = normalize_text(raw)
         toks = [x for x in tokenize(n, lang) if x not in stop_set]
+        try:
+            min_token_len_int = int(min_token_len)
+        except Exception:
+            min_token_len_int = 4
+        if min_token_len_int > 1:
+            filtered = []
+            for x in toks:
+                if re.fullmatch(r"[a-z_]+", x):
+                    if len(x) >= min_token_len_int:
+                        filtered.append(x)
+                else:
+                    filtered.append(x)
+            toks = filtered
+        if keep_nouns_adjs_only and lang in {"en", "mixed"}:
+            toks = keep_nouns_adjs_heuristic(toks)
         tokens.append(toks)
         joined.append(" ".join(toks))
     return tokens, joined, lang
@@ -684,6 +791,9 @@ with c_cfg:
     text_col = st.selectbox("Text column", options=["(auto)"] + all_cols, index=0)
     time_col = st.selectbox("Time column (optional, for Sankey)", options=["(none)"] + all_cols, index=0)
     language = st.selectbox("Language", options=["auto", "en", "zh", "mixed"], index=0)
+    emoji_to_words = st.checkbox("Emoji 转文字", value=True, help="把 😀 🎉 ❤️ 等转成可建模的词（若环境缺少 emoji 库，会自动跳过）。")
+    keep_nouns_adjs_only = st.checkbox("仅保留名词/形容词（近似）", value=False, help="不装 NLP 大库的前提下用启发式过滤动词/助动词。")
+    min_token_len = st.slider("英文最小词长", min_value=2, max_value=8, value=4, step=1, help="减少 eady/oom 这类碎词（中文不受影响）。")
     extra_sw = st.text_area("Extra stopwords (comma separated)", value="", height=80)
     high_df = st.slider("删除高频词（出现率≥%）", min_value=50, max_value=100, value=80, step=5, help="100 表示关闭该过滤")
     top_words_n = st.slider("每个主题展示高频词数量", min_value=30, max_value=300, value=80, step=10)
@@ -713,7 +823,14 @@ with c_run:
 df = build_analysis_text(df_raw, None if text_col == "(auto)" else text_col)
 texts = df["analysis_text"].fillna("").astype(str).tolist()
 stopwords = [s.strip() for s in (extra_sw or "").split(",") if s.strip()]
-tokenized, joined, detected_lang = preprocess_texts(texts, extra_stopwords=stopwords, language=language)
+tokenized, joined, detected_lang = preprocess_texts(
+    texts,
+    extra_stopwords=stopwords,
+    language=language,
+    emoji_to_words=bool(emoji_to_words),
+    min_token_len=int(min_token_len),
+    keep_nouns_adjs_only=bool(keep_nouns_adjs_only),
+)
 max_doc_freq = float(high_df) / 100.0
 if high_df < 100:
     banned_df = high_df_tokens(tokenized, max_doc_freq=max_doc_freq)
