@@ -290,6 +290,57 @@ def zipf_en(token: str) -> float | None:
         return None
 
 
+@st.cache_resource
+def _en_spell_index(n_words: int = 80000) -> Dict[str, Tuple[str, float]]:
+    from wordfreq import top_n_list
+
+    idx: Dict[str, Tuple[str, float]] = {}
+    for w in top_n_list("en", int(n_words)):
+        ww = str(w).lower()
+        if not re.fullmatch(r"[a-z]{3,30}", ww):
+            continue
+        z = zipf_en(ww)
+        if z is None:
+            continue
+
+        def put(k: str):
+            if not k or len(k) < 3:
+                return
+            prev = idx.get(k)
+            if prev is None or float(z) > float(prev[1]):
+                idx[k] = (ww, float(z))
+
+        put(ww)
+        if len(ww) >= 4:
+            put(ww[1:])
+            put(ww[:-1])
+        if len(ww) >= 5:
+            put(ww[:-2])
+        for L in range(4, min(10, len(ww)) + 1):
+            put(ww[:L])
+    return idx
+
+
+def repair_en_token(token: str, zipf_threshold: float) -> str:
+    t = (token or "").strip().lower()
+    if not t or not re.fullmatch(r"[a-z]{3,30}", t):
+        return token
+
+    z = zipf_en(t)
+    if z is not None and float(z) >= float(zipf_threshold):
+        return t
+
+    if not wordfreq_available():
+        return t
+
+    cand = _en_spell_index().get(t)
+    if cand is None:
+        return t
+    if float(cand[1]) < float(zipf_threshold):
+        return t
+    return str(cand[0])
+
+
 def is_readable_en_token(token: str, zipf_threshold: float) -> bool:
     t = (token or "").strip().lower()
     if not t:
@@ -326,6 +377,7 @@ def filter_topic_words(
     weights: List[float] | None,
     readable_en_only: bool,
     zipf_threshold: float,
+    min_en_len: int = 4,
 ):
     if not readable_en_only:
         return words, weights
@@ -334,7 +386,15 @@ def filter_topic_words(
     out_p = [] if weights is not None else None
     for i, w in enumerate(words):
         s = str(w)
-        if re.fullmatch(r"[a-z_]{3,40}", s.lower()):
+        lower = s.lower()
+        if re.fullmatch(r"[a-z_]{3,40}", lower):
+            if "_" in lower:
+                parts = [p for p in lower.split("_") if p]
+                if any(len(p) < int(min_en_len) for p in parts):
+                    continue
+            else:
+                if len(lower) < int(min_en_len):
+                    continue
             if not is_readable_en_token(s, float(zipf_threshold)):
                 continue
         out_w.append(s)
@@ -391,6 +451,8 @@ def preprocess_texts(
     language: Literal["auto", "en", "zh", "mixed"] = "auto",
     emoji_to_words: bool = True,
     fix_mojibake: bool = True,
+    repair_nonwords: bool = True,
+    repair_zipf_threshold: float = 2.5,
     min_token_len: int = 4,
     keep_nouns_adjs_only: bool = False,
 ) -> Tuple[List[List[str]], List[str], Literal["en", "zh", "mixed"]]:
@@ -430,7 +492,10 @@ def preprocess_texts(
         if emoji_to_words:
             raw = demojize_if_available(raw)
         n = normalize_text(raw)
-        toks = [x for x in tokenize(n, lang) if x not in stop_set]
+        toks = tokenize(n, lang)
+        if repair_nonwords and lang in {"en", "mixed"} and wordfreq_available():
+            toks = [repair_en_token(x, float(repair_zipf_threshold)) for x in toks]
+        toks = [x for x in toks if x not in stop_set]
         try:
             min_token_len_int = int(min_token_len)
         except Exception:
@@ -634,6 +699,7 @@ def lda_topics(
     topn: int = 50,
     readable_en_only: bool = False,
     zipf_threshold: float = 2.5,
+    min_display_en_len: int = 4,
 ) -> List[Dict]:
     model = lda_bundle["model"]
     engine = str(lda_bundle.get("engine") or "gensim")
@@ -649,6 +715,7 @@ def lda_topics(
                 p_list,
                 readable_en_only=bool(readable_en_only),
                 zipf_threshold=float(zipf_threshold),
+                min_en_len=int(min_display_en_len),
             )
             rows.append({"topic_id": tid, "words": w_list, "weights": p_list or []})
         return rows
@@ -665,6 +732,7 @@ def lda_topics(
             p_list,
             readable_en_only=bool(readable_en_only),
             zipf_threshold=float(zipf_threshold),
+            min_en_len=int(min_display_en_len),
         )
         rows.append({"topic_id": tid, "words": w_list, "weights": p_list or []})
     return rows
@@ -871,6 +939,7 @@ def run_bertopic_lite(
     topn_words: int = 50,
     readable_en_only: bool = False,
     zipf_threshold: float = 2.5,
+    min_display_en_len: int = 4,
 ):
     from sklearn.cluster import KMeans
     from sklearn.decomposition import TruncatedSVD
@@ -914,6 +983,7 @@ def run_bertopic_lite(
             None,
             readable_en_only=bool(readable_en_only),
             zipf_threshold=float(zipf_threshold),
+            min_en_len=int(min_display_en_len),
         )
         topic_words[tid] = words
 
@@ -1051,6 +1121,8 @@ with c_cfg:
     min_token_len = st.slider("英文最小词长", min_value=2, max_value=10, value=5, step=1, help="减少 eady/oom/expe/champag 这类碎词（中文不受影响）。")
     readable_en_only = st.checkbox("输出仅显示可读英文词", value=True, help="用 wordfreq 过滤疑似乱码/截断碎词（没有该库时会自动降级）。")
     zipf_threshold = st.slider("英文可读阈值（Zipf）", min_value=1.5, max_value=5.5, value=2.5, step=0.1, help="越高越严格，可能会过滤专有名词。", disabled=not readable_en_only)
+    min_display_en_len = st.slider("输出英文最小词长", min_value=3, max_value=10, value=4, step=1, help="进一步把 cli/eve/day/jus 这类短词从主题词输出中移除。", disabled=not readable_en_only)
+    repair_nonwords = st.checkbox("修复碎词为真实英文", value=True, help="尝试把 eady→ready / igh→high / ope→hope 等恢复成常见英文词（依赖 wordfreq）。")
     extra_sw = st.text_area("Extra stopwords (comma separated)", value="", height=80)
     high_df = st.slider("删除高频词（出现率≥%）", min_value=50, max_value=100, value=80, step=5, help="100 表示关闭该过滤")
     top_words_n = st.slider("每个主题展示高频词数量", min_value=30, max_value=300, value=80, step=10)
@@ -1086,6 +1158,8 @@ tokenized, joined, detected_lang = preprocess_texts(
     language=language,
     emoji_to_words=bool(emoji_to_words),
     fix_mojibake=bool(fix_mojibake),
+    repair_nonwords=bool(repair_nonwords),
+    repair_zipf_threshold=float(zipf_threshold),
     min_token_len=int(min_token_len),
     keep_nouns_adjs_only=bool(keep_nouns_adjs_only),
 )
@@ -1122,10 +1196,12 @@ current_sig = make_signature(
         "language": language,
         "emoji_to_words": bool(emoji_to_words),
         "fix_mojibake": bool(fix_mojibake),
+        "repair_nonwords": bool(repair_nonwords),
         "keep_nouns_adjs_only": bool(keep_nouns_adjs_only),
         "min_token_len": int(min_token_len),
         "readable_en_only": bool(readable_en_only),
         "zipf_threshold": float(zipf_threshold) if readable_en_only else None,
+        "min_display_en_len": int(min_display_en_len) if readable_en_only else None,
         "stopwords": stopwords,
         "high_df": int(high_df),
         "model_kind": model_kind,
@@ -1250,6 +1326,7 @@ if run_btn or result is None:
             topn=int(top_words_n),
             readable_en_only=bool(readable_en_only),
             zipf_threshold=float(zipf_threshold) if readable_en_only else 2.5,
+            min_display_en_len=int(min_display_en_len) if readable_en_only else 4,
         )
         labels, scores = lda_assignments(lda_bundle)
         st.session_state.topic_result = {"kind": "LDA", "topics": topics, "labels": labels, "scores": scores, "lda_bundle": lda_bundle}
@@ -1269,6 +1346,7 @@ if run_btn or result is None:
                     topn_words=int(top_words_n),
                     readable_en_only=bool(readable_en_only),
                     zipf_threshold=float(zipf_threshold) if readable_en_only else 2.5,
+                    min_display_en_len=int(min_display_en_len) if readable_en_only else 4,
                 ),
             )
         if bt_err:
