@@ -1,350 +1,960 @@
 import io
+import os
 import re
-from collections import Counter
+import time
+from typing import Dict, List, Literal, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from sklearn.decomposition import LatentDirichletAllocation, TruncatedSVD
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 
 
-st.set_page_config(page_title="LDA / BERTopic Lite", layout="wide")
-
-if "analysis_result" not in st.session_state:
-    st.session_state["analysis_result"] = None
-if "uploaded_file_signature" not in st.session_state:
-    st.session_state["uploaded_file_signature"] = None
+st.set_page_config(page_title="Topic Mining Lite (LDA + BERTopic-lite)", layout="wide")
 
 
-def clean_text(text):
-    text = str(text or "").strip().lower()
-    text = re.sub(r"http\S+", " ", text)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def read_uploaded_file(uploaded_file):
-    suffix = uploaded_file.name.lower()
-    if suffix.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    raise ValueError("仅支持 CSV / XLSX / XLS 文件")
-
-
-def top_words_from_component(feature_names, component, n_words=10):
-    indices = component.argsort()[-n_words:][::-1]
-    return ", ".join(feature_names[i] for i in indices)
-
-
-def run_lda(documents, n_topics):
-    vectorizer = CountVectorizer(
-        stop_words="english",
-        min_df=2,
-        max_df=0.95,
-    )
-    X = vectorizer.fit_transform(documents)
-    lda = LatentDirichletAllocation(
-        n_components=n_topics,
-        random_state=42,
-        learning_method="batch",
-    )
-    doc_topic = lda.fit_transform(X)
-    feature_names = vectorizer.get_feature_names_out()
-
-    topics_df = pd.DataFrame(
-        {
-            "topic_id": list(range(n_topics)),
-            "keywords": [
-                top_words_from_component(feature_names, lda.components_[i])
-                for i in range(n_topics)
-            ],
-        }
-    )
-    assignments = pd.DataFrame(
-        {
-            "document_id": list(range(len(documents))),
-            "dominant_topic": doc_topic.argmax(axis=1),
-            "topic_score": doc_topic.max(axis=1),
-            "text": documents,
-        }
-    )
-    return topics_df, assignments
-
-
-def safe_svd_components(matrix):
-    max_components = min(matrix.shape[0] - 1, matrix.shape[1] - 1)
-    return max(1, min(50, max_components))
-
-
-def build_topic_name_map(topics_df):
-    topic_names = {}
-    for _, row in topics_df.iterrows():
-        topic_names[row["topic_id"]] = row.get("topic_name", f"Topic {row['topic_id']}")
-    return topic_names
-
-
-def get_topic_keywords_df(topic_model, topic_id, top_n=10):
-    topic_words = topic_model.get_topic(topic_id) or []
-    rows = [
-        {"word": word, "score": score}
-        for word, score in topic_words[:top_n]
-        if word and word.strip()
-    ]
-    return pd.DataFrame(rows)
-
-
-def run_bertopic(
-    documents,
-    min_topic_size,
-    reduction_mode,
-    topic_upper_bound,
-    reduce_outliers_flag,
-):
-    from bertopic import BERTopic
-    from hdbscan import HDBSCAN
-    from umap import UMAP
-
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        min_df=2,
-        max_df=0.95,
-        ngram_range=(1, 2),
-    )
-    tfidf = vectorizer.fit_transform(documents)
-
-    n_components = safe_svd_components(tfidf)
-    svd = TruncatedSVD(n_components=n_components, random_state=42)
-    embeddings = svd.fit_transform(tfidf)
-
-    umap_model = UMAP(
-        n_neighbors=min(15, max(2, len(documents) - 1)),
-        n_components=min(5, embeddings.shape[1]) if embeddings.shape[1] > 1 else 1,
-        min_dist=0.0,
-        metric="cosine",
-        random_state=42,
-    )
-    hdbscan_model = HDBSCAN(
-        min_cluster_size=min_topic_size,
-        metric="euclidean",
-        cluster_selection_method="eom",
-        prediction_data=False,
-    )
-    topic_model = BERTopic(
-        embedding_model=None,
-        umap_model=umap_model,
-        hdbscan_model=hdbscan_model,
-        calculate_probabilities=False,
-        verbose=False,
-    )
-
-    topics, _ = topic_model.fit_transform(documents, embeddings=embeddings)
-    info_df = topic_model.get_topic_info()
-    initial_topics_count = int((info_df["Topic"] != -1).sum())
-    initial_outliers = int((pd.Series(topics) == -1).sum())
-
-    if reduction_mode == "自动":
-        topic_model.reduce_topics(documents, nr_topics="auto")
-    elif reduction_mode == "按上限压缩" and initial_topics_count > topic_upper_bound:
-        topic_model.reduce_topics(documents, nr_topics=topic_upper_bound)
-
-    if reduce_outliers_flag and -1 in set(topic_model.topics_):
-        new_topics = topic_model.reduce_outliers(
-            documents,
-            topic_model.topics_,
-            strategy="c-tf-idf",
-        )
-        topic_model.update_topics(documents, topics=new_topics)
-
-    final_topics = topic_model.topics_
-    info_df = topic_model.get_topic_info()
-    info_df = info_df.rename(columns={"Topic": "topic_id", "Name": "topic_name", "Count": "count"})
-    info_df["is_outlier"] = info_df["topic_id"] == -1
-    info_df = info_df[["topic_id", "topic_name", "count", "is_outlier"]]
-    topic_name_map = build_topic_name_map(info_df)
-
-    assignments = pd.DataFrame(
-        {
-            "document_id": list(range(len(documents))),
-            "dominant_topic": final_topics,
-            "topic_name": [topic_name_map.get(topic, f"Topic {topic}") for topic in final_topics],
-            "text": documents,
-        }
-    )
-    metrics = {
-        "initial_topics_count": initial_topics_count,
-        "final_topics_count": int((info_df["topic_id"] != -1).sum()),
-        "initial_outliers": initial_outliers,
-        "final_outliers": int((assignments["dominant_topic"] == -1).sum()),
-    }
-    return topic_model, info_df, assignments, metrics
-
-
-def to_download_bytes(df):
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-st.title("LDA / BERTopic Lite")
-st.caption("轻量版本地主题分析工具：上传文本文件，直接跑 LDA 或 BERTopic。")
-
-uploaded_file = st.file_uploader("上传 CSV / XLSX 文件", type=["csv", "xlsx", "xls"])
-
-if uploaded_file is not None:
-    current_signature = f"{uploaded_file.name}:{uploaded_file.size}"
-    if st.session_state["uploaded_file_signature"] != current_signature:
-        st.session_state["uploaded_file_signature"] = current_signature
-        st.session_state["analysis_result"] = None
-
+def _safe_action(name: str, fn):
     try:
-        raw_df = read_uploaded_file(uploaded_file)
-    except Exception as exc:
-        st.error(f"读取文件失败: {exc}")
+        return fn()
+    except Exception as e:
+        st.error(f"{name} 失败：{e}")
         st.stop()
 
-    st.subheader("原始数据预览")
-    st.dataframe(raw_df.head(20), use_container_width=True)
 
-    text_column = st.selectbox("选择文本列", options=list(raw_df.columns))
-    model_type = st.radio("选择模型", options=["LDA", "BERTopic"], horizontal=True)
+def _reset_all():
+    keys = list(st.session_state.keys())
+    for k in keys:
+        del st.session_state[k]
+    st.rerun()
 
-    left, middle, right = st.columns(3)
-    with left:
-        lda_topics = st.slider("LDA 主题数", min_value=2, max_value=20, value=5)
-    with middle:
-        min_topic_size = st.slider("BERTopic 最小主题大小", min_value=2, max_value=50, value=5)
-    with right:
-        bertopic_topic_upper_bound = st.slider("BERTopic 主题数上限", min_value=2, max_value=30, value=8)
 
-    bertopic_reduction_mode = "不压缩"
-    bertopic_reduce_outliers = False
-    if model_type == "BERTopic":
-        extra_left, extra_right = st.columns(2)
-        with extra_left:
-            bertopic_reduction_mode = st.selectbox(
-                "主题压缩方式",
-                options=["不压缩", "自动", "按上限压缩"],
-                help="自动或按上限压缩会在训练后做主题压缩。",
-            )
-        with extra_right:
-            bertopic_reduce_outliers = st.checkbox(
-                "尝试处理离群点 (-1)",
-                value=True,
-                help="将部分离群文本重新归入最接近的主题。",
-            )
+def read_uploaded_table(uploaded_file):
+    suffix = (uploaded_file.name or "").lower()
+    if suffix.endswith(".csv"):
+        return pd.read_csv(uploaded_file), None
+    if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
+        return pd.read_excel(uploaded_file), None
+    return None, "仅支持 CSV / XLSX / XLS 文件"
 
-    if st.button("开始分析", type="primary"):
-        texts = raw_df[text_column].fillna("").astype(str).map(clean_text)
-        texts = texts[texts != ""]
 
-        if len(texts) < 5:
-            st.error("至少需要 5 条非空文本。")
-            st.stop()
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    s = text.lower()
+    s = re.sub(r"https?://\\S+|www\\.\\S+", " ", s)
+    s = re.sub(r"@[\\w_]+", " ", s)
+    s = re.sub(r"#[\\w_]+", " ", s)
+    s = re.sub(r"[\\r\\n\\t]+", " ", s)
+    s = re.sub(r"[^a-z0-9\\u4e00-\\u9fff ]+", " ", s)
+    s = re.sub(r"\\s{2,}", " ", s).strip()
+    return s
 
-        st.write(f"有效文本数: {len(texts)}")
-        with st.spinner(f"正在运行 {model_type} ..."):
-            if model_type == "LDA":
-                topics_df, assignments_df = run_lda(texts.tolist(), lda_topics)
-                topic_model = None
-                bertopic_metrics = None
+
+def _zh_char_ngrams(s: str, n: int) -> List[str]:
+    if not s or n <= 0:
+        return []
+    chars = [c for c in s if "\\u4e00" <= c <= "\\u9fff"]
+    if len(chars) < n:
+        return []
+    return ["".join(chars[i : i + n]) for i in range(0, len(chars) - n + 1)]
+
+
+def tokenize(text: str, language: Literal["en", "zh", "mixed"] = "mixed") -> List[str]:
+    if not text:
+        return []
+    tokens: List[str] = []
+    if language in {"en", "mixed"}:
+        tokens.extend(re.findall(r"[a-z]{3,25}", text))
+        tokens.extend(re.findall(r"\\d{2,}", text))
+    if language in {"zh", "mixed"}:
+        zh_seqs = re.findall(r"[\\u4e00-\\u9fff]{2,}", text)
+        for seq in zh_seqs:
+            tokens.extend(_zh_char_ngrams(seq, 2))
+            tokens.extend(_zh_char_ngrams(seq, 3))
+        tokens.extend(re.findall(r"[\\u4e00-\\u9fff]{1,6}", text))
+    return [t for t in tokens if t and t.strip()]
+
+
+def _detect_language_for_corpus(texts: List[str]) -> Literal["en", "zh", "mixed"]:
+    joined = " ".join([t for t in texts[:200] if isinstance(t, str)])
+    if not joined:
+        return "mixed"
+    cjk = sum(1 for ch in joined if "\\u4e00" <= ch <= "\\u9fff")
+    latin = sum(1 for ch in joined if "a" <= ch.lower() <= "z")
+    if cjk > 0 and latin == 0:
+        return "zh"
+    if latin > 0 and cjk == 0:
+        return "en"
+    if cjk >= latin * 0.8:
+        return "zh"
+    if latin >= cjk * 0.8:
+        return "en"
+    return "mixed"
+
+
+def preprocess_texts(
+    texts: List[str],
+    extra_stopwords: List[str] | None = None,
+    language: Literal["auto", "en", "zh", "mixed"] = "auto",
+) -> Tuple[List[List[str]], List[str], Literal["en", "zh", "mixed"]]:
+    try:
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        base_sw = set(ENGLISH_STOP_WORDS)
+    except Exception:
+        base_sw = set()
+
+    zh_sw = {
+        "的", "了", "和", "是", "在", "我", "你", "他", "她", "它", "我们", "你们", "他们",
+        "这个", "那个", "这些", "那些", "一个", "一种", "这样", "那样", "然后", "但是", "所以",
+        "因为", "如果", "就是", "还是", "没有", "不是", "可能", "可以", "感觉", "觉得", "比较",
+    }
+
+    lang = _detect_language_for_corpus(texts) if language == "auto" else language
+    stop_set = set()
+    if lang in {"en", "mixed"}:
+        stop_set |= base_sw
+    if lang in {"zh", "mixed"}:
+        stop_set |= zh_sw
+    if extra_stopwords:
+        for s in extra_stopwords:
+            if not isinstance(s, str):
+                continue
+            n = normalize_text(s)
+            if not n:
+                continue
+            stop_set.add(n)
+
+    tokens = []
+    joined = []
+    for t in texts:
+        n = normalize_text(t)
+        toks = [x for x in tokenize(n, lang) if x not in stop_set]
+        tokens.append(toks)
+        joined.append(" ".join(toks))
+    return tokens, joined, lang
+
+
+def high_df_tokens(tokenized_docs: List[List[str]], max_doc_freq: float = 0.8) -> Dict[str, int]:
+    if not tokenized_docs:
+        return {}
+    try:
+        max_doc_freq = float(max_doc_freq)
+    except Exception:
+        max_doc_freq = 0.8
+    if max_doc_freq <= 0 or max_doc_freq >= 1:
+        return {}
+
+    n_docs = len(tokenized_docs)
+    df = {}
+    for doc in tokenized_docs:
+        for tok in set(doc):
+            df[tok] = df.get(tok, 0) + 1
+
+    cutoff = int(np.ceil(max_doc_freq * n_docs))
+    return {t: c for t, c in df.items() if c >= cutoff}
+
+
+def drop_high_df_tokens(tokenized_docs: List[List[str]], max_doc_freq: float = 0.8) -> List[List[str]]:
+    banned = set(high_df_tokens(tokenized_docs, max_doc_freq=max_doc_freq).keys())
+    if not banned:
+        return tokenized_docs
+    return [[t for t in doc if t not in banned] for doc in tokenized_docs]
+
+
+def build_analysis_text(df: pd.DataFrame, text_col: str | None) -> pd.DataFrame:
+    out = df.copy()
+    if text_col and text_col in out.columns:
+        out["analysis_text"] = out[text_col].fillna("").astype(str)
+        return out
+
+    title_col = None
+    for c in ("Title", "title"):
+        if c in out.columns:
+            title_col = c
+            break
+    content_col = None
+    for c in ("content", "Content", "text", "Text"):
+        if c in out.columns:
+            content_col = c
+            break
+
+    if title_col is None and content_col is None:
+        out["analysis_text"] = ""
+        return out
+
+    parts = []
+    for _, row in out.iterrows():
+        t = str(row.get(title_col, "") or "").strip() if title_col else ""
+        c = str(row.get(content_col, "") or "").strip() if content_col else ""
+        if t and c:
+            if c.lower().startswith(t.lower()) or t.lower() == c.lower():
+                parts.append(c)
             else:
-                topic_model, topics_df, assignments_df, bertopic_metrics = run_bertopic(
-                    texts.tolist(),
-                    min_topic_size,
-                    bertopic_reduction_mode,
-                    bertopic_topic_upper_bound,
-                    bertopic_reduce_outliers,
-                )
+                parts.append(f"{t} {c}".strip())
+        else:
+            parts.append((t or c or "").strip())
+    out["analysis_text"] = pd.Series(parts, index=out.index).fillna("").astype(str)
+    return out
 
-        st.session_state["analysis_result"] = {
-            "model_type": model_type,
-            "topic_model": topic_model,
-            "topics_df": topics_df,
-            "assignments_df": assignments_df,
-            "bertopic_metrics": bertopic_metrics,
-        }
 
-    analysis_result = st.session_state.get("analysis_result")
-    if analysis_result:
-        model_type = analysis_result["model_type"]
-        topic_model = analysis_result["topic_model"]
-        topics_df = analysis_result["topics_df"]
-        assignments_df = analysis_result["assignments_df"]
-        bertopic_metrics = analysis_result["bertopic_metrics"]
+def run_lda(
+    tokenized_docs: List[List[str]],
+    num_topics: int = 8,
+    passes: int = 10,
+    iterations: int = 100,
+    alpha: str | float = "auto",
+    eta: float = 0.01,
+    random_state: int = 42,
+    no_below: int = 2,
+    no_above: float = 0.9,
+    keep_n: int = 20000,
+    minimum_probability: float = 0.0,
+):
+    from gensim import corpora
+    from gensim.models import LdaModel
 
-        st.subheader("主题结果")
-        st.dataframe(topics_df, use_container_width=True)
+    docs = [d for d in tokenized_docs if d]
+    if not docs:
+        return None, "No valid tokens for LDA"
 
-        if model_type == "BERTopic" and bertopic_metrics:
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-            metric_col1.metric("初始主题数", bertopic_metrics["initial_topics_count"])
-            metric_col2.metric("最终主题数", bertopic_metrics["final_topics_count"])
-            metric_col3.metric("初始离群点", bertopic_metrics["initial_outliers"])
-            metric_col4.metric("最终离群点", bertopic_metrics["final_outliers"])
+    dictionary = corpora.Dictionary(docs)
+    dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
+    if len(dictionary) == 0:
+        return None, "Empty dictionary after filtering. Try lowering min_df/stopwords."
 
-        st.subheader("文档主题分配")
-        st.dataframe(assignments_df.head(100), use_container_width=True)
+    corpus = [dictionary.doc2bow(d) for d in docs]
+    if not any(len(x) > 0 for x in corpus):
+        return None, "Empty corpus after filtering."
 
-        topic_counter = Counter(assignments_df["dominant_topic"])
-        chart_df = pd.DataFrame(
-            {"topic": list(topic_counter.keys()), "count": list(topic_counter.values())}
-        ).sort_values("count", ascending=False)
-        st.subheader("主题分布")
-        st.plotly_chart(
-            px.bar(chart_df, x="topic", y="count", title="主题大小分布"),
-            use_container_width=True,
+    k = int(max(2, min(int(num_topics), 60)))
+    model = LdaModel(
+        corpus=corpus,
+        id2word=dictionary,
+        num_topics=k,
+        passes=int(max(1, passes)),
+        alpha=alpha,
+        eta=float(eta),
+        random_state=int(random_state),
+        iterations=int(max(30, iterations)),
+        eval_every=None,
+        minimum_probability=float(minimum_probability),
+    )
+    return {"model": model, "dictionary": dictionary, "corpus": corpus, "num_topics": k}, None
+
+
+def lda_topics(lda_bundle, topn: int = 50) -> List[Dict]:
+    model = lda_bundle["model"]
+    rows = []
+    for tid in range(int(lda_bundle["num_topics"])):
+        words = model.show_topic(tid, topn=int(topn))
+        rows.append({"topic_id": tid, "words": [w for w, _ in words], "weights": [float(p) for _, p in words]})
+    return rows
+
+
+def lda_assignments(lda_bundle) -> Tuple[List[int], List[float]]:
+    model = lda_bundle["model"]
+    corpus = lda_bundle["corpus"]
+    labels = []
+    scores = []
+    for bow in corpus:
+        dist = model.get_document_topics(bow, minimum_probability=0.0)
+        if not dist:
+            labels.append(0)
+            scores.append(0.0)
+            continue
+        best = max(dist, key=lambda x: x[1])
+        labels.append(int(best[0]))
+        scores.append(float(best[1]))
+    return labels, scores
+
+
+def lda_mds_word_map(
+    lda_bundle,
+    prob_threshold: float = 0.0035,
+    max_words: int = 500,
+    random_state: int = 42,
+):
+    from sklearn.manifold import MDS
+    from sklearn.metrics.pairwise import cosine_distances
+
+    model = lda_bundle["model"]
+    dictionary = lda_bundle["dictionary"]
+    phi = model.get_topics()
+    if phi is None or phi.size == 0:
+        return None, "Empty topic-word distribution"
+
+    prob_threshold = float(prob_threshold)
+    max_words = int(max_words)
+    if max_words <= 0:
+        return None, "max_words must be > 0"
+
+    vocab_size = int(phi.shape[1])
+    terms = [dictionary[i] for i in range(vocab_size)]
+    phi_t = phi.T
+
+    best_topic = np.argmax(phi_t, axis=1).astype(int)
+    best_prob = np.max(phi_t, axis=1)
+    keep_idx = np.where(best_prob >= prob_threshold)[0]
+    if keep_idx.size == 0:
+        return None, f"No words meet threshold {prob_threshold}"
+
+    if keep_idx.size > max_words:
+        keep_idx = keep_idx[np.argsort(best_prob[keep_idx])[::-1][:max_words]]
+
+    X = phi_t[keep_idx]
+    D = cosine_distances(X)
+
+    mds = MDS(
+        n_components=2,
+        dissimilarity="precomputed",
+        random_state=int(random_state),
+        n_init=1,
+        max_iter=300,
+        normalized_stress="auto",
+    )
+    coords = mds.fit_transform(D)
+
+    rows = []
+    for j, vid in enumerate(keep_idx.tolist()):
+        rows.append(
+            {
+                "word": str(terms[int(vid)]),
+                "topic_id": int(best_topic[int(vid)]),
+                "prob": float(best_prob[int(vid)]),
+                "x": float(coords[j, 0]),
+                "y": float(coords[j, 1]),
+            }
         )
+    return pd.DataFrame(rows), None
 
-        if model_type == "BERTopic":
-            selectable_topics = topics_df["topic_id"].tolist()
-            selected_topic = st.selectbox(
-                "查看单个主题细节",
-                options=selectable_topics,
-                format_func=lambda topic_id: (
-                    f"Topic {topic_id} | "
-                    + str(
-                        topics_df.loc[topics_df["topic_id"] == topic_id, "topic_name"].iloc[0]
+
+def lda_tune_k_alpha_light(
+    tokenized_docs: List[List[str]],
+    k_values: List[int],
+    alpha_values: List[str | float],
+    passes: int = 4,
+    iterations: int = 80,
+    eta: float = 0.01,
+    random_state: int = 42,
+    sample_size: int = 800,
+    coherence: str = "c_v",
+    no_below: int = 2,
+    no_above: float = 0.9,
+    keep_n: int = 20000,
+):
+    from gensim import corpora
+    from gensim.models import CoherenceModel, LdaModel
+
+    docs = [d for d in tokenized_docs if d]
+    if not docs:
+        return None, "No valid tokens for tuning"
+
+    if sample_size and len(docs) > int(sample_size):
+        rng = np.random.default_rng(int(random_state))
+        idx = rng.choice(len(docs), size=int(sample_size), replace=False)
+        docs = [docs[int(i)] for i in idx.tolist()]
+
+    dictionary = corpora.Dictionary(docs)
+    dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
+    if len(dictionary) == 0:
+        return None, "Empty dictionary after filtering"
+
+    corpus = [dictionary.doc2bow(d) for d in docs]
+    if not any(len(x) > 0 for x in corpus):
+        return None, "Empty corpus after filtering"
+
+    k_values = sorted({int(k) for k in k_values if int(k) >= 2})
+    if not k_values:
+        return None, "k_values empty"
+
+    cleaned_alphas: List[str | float] = []
+    for a in alpha_values:
+        if isinstance(a, str) and a in {"auto", "symmetric", "asymmetric"}:
+            cleaned_alphas.append(a)
+            continue
+        try:
+            cleaned_alphas.append(float(a))
+        except Exception:
+            continue
+    if not cleaned_alphas:
+        return None, "alpha_values empty"
+
+    rows = []
+    for k in k_values:
+        for alpha in cleaned_alphas:
+            try:
+                model = LdaModel(
+                    corpus=corpus,
+                    id2word=dictionary,
+                    num_topics=int(k),
+                    passes=int(max(1, passes)),
+                    alpha=alpha,
+                    eta=float(eta),
+                    random_state=int(random_state),
+                    iterations=int(max(30, iterations)),
+                    eval_every=None,
+                    minimum_probability=0.0,
+                )
+                cm = CoherenceModel(model=model, texts=docs, dictionary=dictionary, coherence=str(coherence))
+                score = float(cm.get_coherence())
+                rows.append({"k": int(k), "alpha": str(alpha), "coherence": score})
+            except Exception as e:
+                rows.append({"k": int(k), "alpha": str(alpha), "coherence": None, "error": str(e)})
+
+    df = pd.DataFrame(rows)
+    ok = df.dropna(subset=["coherence"]).copy()
+    if ok.empty:
+        return df, "All tuning runs failed"
+    best = ok.sort_values("coherence", ascending=False).iloc[0].to_dict()
+    return {"grid": df, "best": best}, None
+
+
+def run_bertopic_lite(
+    texts: List[str],
+    n_topics: int = 10,
+    ngram_min: int = 1,
+    ngram_max: int = 2,
+    max_features: int = 5000,
+    min_df: int = 2,
+    max_df: float = 0.95,
+    random_state: int = 42,
+    topn_words: int = 50,
+):
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    cleaned = [t for t in texts]
+    if not any(s.strip() for s in cleaned):
+        return None, "No valid text for BERTopic-lite"
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(int(ngram_min), int(ngram_max)),
+        max_features=int(max_features),
+        min_df=int(min_df),
+        max_df=float(max_df),
+    )
+    X = vectorizer.fit_transform(cleaned)
+    if X.shape[1] == 0:
+        return None, "Empty vocabulary after TF-IDF. Try lowering min_df or adjusting preprocessing."
+
+    n_components = int(min(100, max(2, X.shape[1] - 1)))
+    svd = TruncatedSVD(n_components=n_components, random_state=int(random_state))
+    Xr = svd.fit_transform(X)
+
+    k = int(max(2, min(int(n_topics), len(cleaned))))
+    km = KMeans(n_clusters=k, random_state=int(random_state), n_init="auto")
+    labels = km.fit_predict(Xr)
+
+    terms = np.array(vectorizer.get_feature_names_out())
+    topic_words = {}
+    topn = int(max(10, topn_words))
+    for tid in range(k):
+        mask = labels == tid
+        if not np.any(mask):
+            topic_words[tid] = []
+            continue
+        tfidf_sum = np.asarray(X[mask].sum(axis=0)).reshape(-1)
+        top_idx = np.argsort(tfidf_sum)[::-1][: min(topn, len(terms))]
+        topic_words[tid] = [str(t) for t in terms[top_idx] if str(t).strip()]
+
+    doc_2d = Xr[:, :2] if Xr.shape[1] >= 2 else np.hstack([Xr, np.zeros((Xr.shape[0], 1))])
+    return {
+        "labels": labels.tolist(),
+        "doc_2d": doc_2d.tolist(),
+        "topic_words": topic_words,
+        "n_topics": k,
+    }, None
+
+
+def build_topic_evolution_sankey(
+    df: pd.DataFrame,
+    time_col: str,
+    topic_col: str,
+    top_words_by_topic: Dict[int, List[str]],
+    freq: str = "M",
+    similarity_threshold: float = 0.35,
+    min_docs_per_period: int = 10,
+):
+    ts = pd.to_datetime(df[time_col], errors="coerce")
+    tmp = df.copy()
+    tmp["_ts"] = ts
+    tmp = tmp.dropna(subset=["_ts"])
+    if tmp.empty:
+        return None, "No valid timestamps"
+    tmp["_period"] = tmp["_ts"].dt.to_period(freq).dt.to_timestamp()
+    tmp["_topic"] = tmp[topic_col]
+
+    counts = tmp.groupby(["_period", "_topic"]).size().reset_index(name="count")
+    period_totals = counts.groupby("_period")["count"].sum().to_dict()
+    periods = sorted([p for p in counts["_period"].unique().tolist() if int(period_totals.get(p, 0)) >= int(min_docs_per_period)])
+    if len(periods) < 2:
+        return None, "Not enough periods after filtering"
+    counts = counts[counts["_period"].isin(periods)]
+    by_period = {p: counts[counts["_period"] == p] for p in periods}
+
+    node_id = {}
+    labels = []
+
+    def get_node(p, t):
+        key = (p, int(t))
+        if key in node_id:
+            return node_id[key]
+        node_id[key] = len(labels)
+        labels.append(f"{p.strftime('%Y-%m')} · T{int(t)+1}")
+        return node_id[key]
+
+    sources, targets, values = [], [], []
+    for i in range(len(periods) - 1):
+        p0, p1 = periods[i], periods[i + 1]
+        left = by_period[p0]
+        right = by_period[p1]
+        for _, r0 in left.iterrows():
+            t0 = int(r0["_topic"])
+            c0 = int(r0["count"])
+            w0 = set(top_words_by_topic.get(t0, []) or [])
+            n0 = get_node(p0, t0)
+            for _, r1 in right.iterrows():
+                t1 = int(r1["_topic"])
+                c1 = int(r1["count"])
+                w1 = set(top_words_by_topic.get(t1, []) or [])
+                if not w0 or not w1:
+                    sim = 1.0 if t0 == t1 else 0.0
+                else:
+                    sim = len(w0 & w1) / max(1, len(w0 | w1))
+                if float(sim) < float(similarity_threshold):
+                    continue
+                weight = float(min(c0, c1)) * float(sim)
+                if weight <= 0:
+                    continue
+                n1 = get_node(p1, t1)
+                sources.append(n0)
+                targets.append(n1)
+                values.append(weight)
+
+    return {"labels": labels, "sources": sources, "targets": targets, "values": values}, None
+
+
+st.title("Topic Mining Lite (LDA + BERTopic-lite)")
+
+with st.sidebar:
+    st.header("Data")
+    uploaded = st.file_uploader("Upload CSV / Excel", type=["csv", "xlsx", "xls"])
+    if st.button("Reset App", type="secondary"):
+        _reset_all()
+
+if uploaded is None:
+    st.info("先上传一个包含文本列的 CSV / XLSX 文件。")
+    st.stop()
+
+df_raw, err = _safe_action("读取上传文件", lambda: read_uploaded_table(uploaded))
+if err:
+    st.error(err)
+    st.stop()
+if df_raw is None or df_raw.empty:
+    st.error("文件读取成功但内容为空。")
+    st.stop()
+
+st.subheader("Data Preview")
+st.dataframe(df_raw.head(50), use_container_width=True)
+
+all_cols = df_raw.columns.tolist()
+
+c_cfg, c_run = st.columns([3, 2])
+with c_cfg:
+    st.subheader("Config")
+    text_col = st.selectbox("Text column", options=["(auto)"] + all_cols, index=0)
+    time_col = st.selectbox("Time column (optional, for Sankey)", options=["(none)"] + all_cols, index=0)
+    language = st.selectbox("Language", options=["auto", "en", "zh", "mixed"], index=0)
+    extra_sw = st.text_area("Extra stopwords (comma separated)", value="", height=80)
+    high_df = st.slider("删除高频词（出现率≥%）", min_value=50, max_value=100, value=80, step=5, help="100 表示关闭该过滤")
+    top_words_n = st.slider("每个主题展示高频词数量", min_value=30, max_value=300, value=80, step=10)
+    model_kind = st.radio("Model", options=["LDA", "BERTopic-lite"], horizontal=True)
+
+    if model_kind == "LDA":
+        lda_k = st.slider("K topics", min_value=2, max_value=30, value=8, step=1, key="lda_k")
+        lda_passes = st.slider("passes", min_value=1, max_value=40, value=10, step=1, key="lda_passes")
+        lda_iterations = st.slider("iterations", min_value=30, max_value=400, value=120, step=10, key="lda_iterations")
+        lda_alpha = st.selectbox("alpha", options=["auto", "symmetric", "asymmetric", "0.1", "0.5", "1.0"], index=0, key="lda_alpha")
+        lda_eta = st.number_input("eta (beta)", min_value=0.0001, max_value=1.0, value=0.01, step=0.01, format="%.4f", key="lda_eta")
+        lda_no_below = st.slider("min_df (no_below)", min_value=1, max_value=20, value=2, step=1, key="lda_no_below")
+        lda_no_above = st.slider("max_df (no_above)", min_value=0.50, max_value=1.00, value=0.90, step=0.05, key="lda_no_above")
+        lda_keep_n = st.slider("keep_n", min_value=2000, max_value=60000, value=20000, step=2000, key="lda_keep_n")
+    else:
+        bt_k = st.slider("K topics", min_value=2, max_value=30, value=10, step=1)
+        bt_max_features = st.slider("max_features", min_value=1000, max_value=20000, value=5000, step=500)
+        bt_ngram_min = st.selectbox("ngram min", options=[1, 2], index=0)
+        bt_ngram_max = st.selectbox("ngram max", options=[1, 2, 3], index=1)
+        bt_min_df = st.slider("min_df", min_value=1, max_value=10, value=2, step=1)
+        bt_max_df = st.slider("max_df", min_value=0.50, max_value=1.00, value=0.95, step=0.05)
+
+with c_run:
+    st.subheader("Run")
+    run_btn = st.button("Run Topic Model", type="primary")
+
+df = build_analysis_text(df_raw, None if text_col == "(auto)" else text_col)
+texts = df["analysis_text"].fillna("").astype(str).tolist()
+stopwords = [s.strip() for s in (extra_sw or "").split(",") if s.strip()]
+tokenized, joined, detected_lang = preprocess_texts(texts, extra_stopwords=stopwords, language=language)
+max_doc_freq = float(high_df) / 100.0
+if high_df < 100:
+    banned_df = high_df_tokens(tokenized, max_doc_freq=max_doc_freq)
+    tokenized_after = drop_high_df_tokens(tokenized, max_doc_freq=max_doc_freq)
+    if not any(tokenized_after):
+        st.warning("高频词过滤导致所有文本为空，已自动跳过该过滤。建议把阈值调高到 90–100。")
+    else:
+        tokenized = tokenized_after
+        with st.expander(f"已移除高频词：{len(banned_df)} 个（出现率≥{high_df}%）", expanded=False):
+            if banned_df:
+                ban_df = pd.DataFrame(sorted(banned_df.items(), key=lambda x: x[1], reverse=True), columns=["token", "doc_count"])
+                st.dataframe(ban_df.head(200), use_container_width=True, hide_index=True)
+joined = [" ".join(t) for t in tokenized]
+
+valid_mask = [bool(t) for t in tokenized]
+if not any(valid_mask):
+    st.error("所有文本清洗后都为空，请检查文本列/停用词设置。")
+    st.stop()
+
+df_valid = df.loc[[i for i, ok in enumerate(valid_mask) if ok]].copy()
+tokenized_valid = [t for t in tokenized if t]
+joined_valid = [t for t in joined if t.strip()]
+
+st.caption(f"Detected language: {detected_lang}")
+st.caption(f"Valid docs: {len(df_valid)} / {len(df)}")
+
+if model_kind == "LDA":
+    with st.expander("轻量调参：寻找最优 K 与 alpha（Coherence c_v）", expanded=False):
+        t_col1, t_col2, t_col3 = st.columns(3)
+        with t_col1:
+            tune_k_min = st.slider("K min", min_value=2, max_value=30, value=2, step=1, key="tune_k_min")
+        with t_col2:
+            tune_k_max = st.slider("K max", min_value=2, max_value=30, value=min(15, 30), step=1, key="tune_k_max")
+        with t_col3:
+            tune_k_step = st.selectbox("K step", options=[1, 2, 3, 4, 5], index=1, key="tune_k_step")
+        tune_sample = st.slider("Sample docs（加速）", min_value=100, max_value=2000, value=800, step=100, key="tune_sample")
+        tune_passes = st.slider("Tuning passes（加速）", min_value=1, max_value=10, value=4, step=1, key="tune_passes")
+        tune_iterations = st.slider("Tuning iterations（加速）", min_value=30, max_value=200, value=80, step=10, key="tune_iterations")
+        tune_alpha_candidates = st.multiselect(
+            "Alpha candidates",
+            options=["auto", "symmetric", "asymmetric", "0.1", "0.5", "1.0"],
+            default=["auto", "symmetric", "asymmetric"],
+            key="tune_alpha_candidates",
+        )
+        if st.button("Run tuning", key="run_tuning_btn"):
+            if tune_k_max < tune_k_min:
+                st.error("K max 必须 >= K min")
+            elif not tune_alpha_candidates:
+                st.error("至少选择一个 alpha")
+            else:
+                k_vals = list(range(int(tune_k_min), int(tune_k_max) + 1, int(tune_k_step)))
+                with st.spinner("Running lightweight tuning..."):
+                    tune_res, tune_err = _safe_action(
+                        "调参",
+                        lambda: lda_tune_k_alpha_light(
+                            tokenized_valid,
+                            k_values=k_vals,
+                            alpha_values=tune_alpha_candidates,
+                            passes=int(tune_passes),
+                            iterations=int(tune_iterations),
+                            eta=float(st.session_state.get("lda_eta", 0.01)),
+                            random_state=42,
+                            sample_size=int(tune_sample),
+                            coherence="c_v",
+                            no_below=int(st.session_state.get("lda_no_below", 2)),
+                            no_above=float(st.session_state.get("lda_no_above", 0.9)),
+                            keep_n=int(st.session_state.get("lda_keep_n", 20000)),
+                        ),
                     )
+                if tune_err:
+                    st.error(tune_err)
+                else:
+                    st.session_state.tuning_result = tune_res
+        tune_res = st.session_state.get("tuning_result")
+        if tune_res:
+            grid = tune_res["grid"]
+            best = tune_res["best"]
+            st.caption(f"Best: K={best.get('k')} alpha={best.get('alpha')} coherence={best.get('coherence')}")
+            show = grid.copy().sort_values(["alpha", "k"])
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            ok = show.dropna(subset=["coherence"])
+            if not ok.empty:
+                fig_tune = px.line(ok, x="k", y="coherence", color="alpha", markers=True, title="Coherence (c_v) by K and alpha")
+                st.plotly_chart(fig_tune, use_container_width=True)
+            if st.button("Apply best K/alpha", key="apply_best_btn"):
+                try:
+                    st.session_state["lda_k"] = int(best.get("k") or st.session_state.get("lda_k", 8))
+                except Exception:
+                    pass
+                try:
+                    st.session_state["lda_alpha"] = str(best.get("alpha") or st.session_state.get("lda_alpha", "auto"))
+                except Exception:
+                    pass
+                st.success("已应用推荐参数：请重新点击 Run Topic Model。")
+
+result = st.session_state.get("topic_result")
+meta = st.session_state.get("topic_meta")
+
+if run_btn or result is None:
+    if model_kind == "LDA":
+        alpha_val = lda_alpha
+        try:
+            alpha_val = float(lda_alpha)
+        except Exception:
+            pass
+        with st.spinner("Training LDA..."):
+            lda_bundle, lda_err = _safe_action(
+                "运行 LDA",
+                lambda: run_lda(
+                    tokenized_valid,
+                    num_topics=int(lda_k),
+                    passes=int(lda_passes),
+                    iterations=int(lda_iterations),
+                    alpha=alpha_val,
+                    eta=float(lda_eta),
+                    no_below=int(lda_no_below),
+                    no_above=float(lda_no_above),
+                    keep_n=int(lda_keep_n),
                 ),
             )
-            keyword_df = get_topic_keywords_df(topic_model, selected_topic)
+        if lda_err:
+            st.error(lda_err)
+            st.stop()
+        topics = lda_topics(lda_bundle, topn=int(top_words_n))
+        labels, scores = lda_assignments(lda_bundle)
+        st.session_state.topic_result = {"kind": "LDA", "topics": topics, "labels": labels, "scores": scores, "lda_bundle": lda_bundle}
+        st.session_state.topic_meta = {"k": int(lda_bundle["num_topics"])}
+    else:
+        with st.spinner("Training BERTopic-lite..."):
+            bt_res, bt_err = _safe_action(
+                "运行 BERTopic-lite",
+                lambda: run_bertopic_lite(
+                    joined_valid,
+                    n_topics=int(bt_k),
+                    ngram_min=int(bt_ngram_min),
+                    ngram_max=int(max(bt_ngram_min, bt_ngram_max)),
+                    max_features=int(bt_max_features),
+                    min_df=int(bt_min_df),
+                    max_df=float(bt_max_df),
+                    topn_words=int(top_words_n),
+                ),
+            )
+        if bt_err:
+            st.error(bt_err)
+            st.stop()
+        st.session_state.topic_result = {"kind": "BERTopic-lite", **bt_res}
+        st.session_state.topic_meta = {"k": int(bt_res["n_topics"])}
 
-            detail_left, detail_right = st.columns([1, 2])
-            with detail_left:
-                st.markdown("**主题关键词**")
-                st.dataframe(keyword_df, use_container_width=True)
-            with detail_right:
-                if not keyword_df.empty:
-                    st.plotly_chart(
-                        px.bar(
-                            keyword_df.sort_values("score", ascending=True),
-                            x="score",
-                            y="word",
-                            orientation="h",
-                            title=f"Topic {selected_topic} 关键词权重",
-                        ),
-                        use_container_width=True,
-                    )
+    result = st.session_state.topic_result
+    meta = st.session_state.topic_meta
+    time.sleep(0.1)
 
-            st.markdown("**该主题下的文本样本**")
-            topic_examples = assignments_df[assignments_df["dominant_topic"] == selected_topic].head(20)
-            st.dataframe(topic_examples, use_container_width=True)
+st.markdown("---")
+st.subheader("Topics")
 
-        st.download_button(
-            "下载主题结果 Excel",
-            data=to_download_bytes(topics_df),
-            file_name=f"{model_type.lower()}_topics.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "下载文档主题分配 Excel",
-            data=to_download_bytes(assignments_df),
-            file_name=f"{model_type.lower()}_assignments.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+topic_names = st.session_state.get("topic_names")
+if topic_names is None:
+    k = int(meta.get("k", 0) or 0)
+    topic_names = {i: f"Topic {i+1}" for i in range(k)}
+    st.session_state.topic_names = topic_names
+
+if result["kind"] == "LDA":
+    topics_df = pd.DataFrame(
+        [{"Topic_ID": r["topic_id"], "Topic": topic_names.get(r["topic_id"], f"Topic {r['topic_id']+1}"), "Words": ", ".join(r["words"][:20])} for r in result["topics"]]
+    )
+    st.dataframe(topics_df, use_container_width=True, hide_index=True)
+    k_all = int(meta.get("k", 0) or 0)
+    topic_doc_counts = pd.Series(result["labels"]).value_counts().reindex(range(k_all), fill_value=0).to_dict()
+    for r in result["topics"]:
+        tid = int(r["topic_id"])
+        doc_n = int(topic_doc_counts.get(tid, 0))
+        with st.expander(f"Topic {tid+1} 高频词（前 {len(r['words'])}） · 文档数 {doc_n}", expanded=False):
+            detail = pd.DataFrame({"word": r["words"], "weight": r["weights"]})
+            st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    counts = pd.Series(result["labels"]).value_counts().reindex(range(k_all), fill_value=0).sort_index()
+    bar_df = pd.DataFrame({"Topic_ID": counts.index.astype(int), "Count": counts.values})
+    bar_df["Topic"] = bar_df["Topic_ID"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
+    fig = px.bar(bar_df, x="Count", y="Topic", orientation="h", title="Docs per Topic")
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("先上传一个包含文本列的 CSV / XLSX 文件。")
+    topic_words = result.get("topic_words") or {}
+    topics_df = pd.DataFrame(
+        [{"Topic_ID": int(tid), "Topic": topic_names.get(int(tid), f"Topic {int(tid)+1}"), "Words": ", ".join(words[:20])} for tid, words in topic_words.items()]
+    ).sort_values("Topic_ID")
+    st.dataframe(topics_df, use_container_width=True, hide_index=True)
+    for tid, words in sorted(topic_words.items(), key=lambda x: int(x[0])):
+        with st.expander(f"Topic {int(tid)+1} 高频词（前 {len(words)}）", expanded=False):
+            st.dataframe(pd.DataFrame({"word": list(words)}), use_container_width=True, hide_index=True)
+
+    k_all = int(meta.get("k", 0) or 0)
+    counts = pd.Series(result["labels"]).value_counts().reindex(range(k_all), fill_value=0).sort_index()
+    bar_df = pd.DataFrame({"Topic_ID": counts.index.astype(int), "Count": counts.values})
+    bar_df["Topic"] = bar_df["Topic_ID"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
+    fig = px.bar(bar_df, x="Count", y="Topic", orientation="h", title="Docs per Topic")
+    st.plotly_chart(fig, use_container_width=True)
+
+    doc_2d = pd.DataFrame(result["doc_2d"], columns=["x", "y"])
+    doc_2d["Topic_ID"] = result["labels"]
+    centroids = doc_2d.groupby("Topic_ID")[["x", "y"]].mean().reset_index()
+    centroids["Count"] = doc_2d.groupby("Topic_ID").size().values
+    centroids["Topic"] = centroids["Topic_ID"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
+    fig2 = px.scatter(centroids, x="x", y="y", size="Count", color="Topic", title="Intertopic Distance Map (SVD 2D)")
+    st.plotly_chart(fig2, use_container_width=True)
+
+st.subheader("Rename Topics")
+rename_cols = st.columns(4)
+k = int(meta.get("k", 0) or 0)
+for i in range(k):
+    with rename_cols[i % 4]:
+        topic_names[i] = st.text_input(f"T{i+1}", value=topic_names.get(i, f"Topic {i+1}"), key=f"topic_name_{i}")
+st.session_state.topic_names = topic_names
+
+st.markdown("---")
+st.subheader("Export")
+
+labels = result["labels"]
+df_out = df_valid.copy()
+df_out["Topic_ID"] = labels
+df_out["Topic"] = df_out["Topic_ID"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
+if result["kind"] == "LDA":
+    df_out["Topic_Score"] = result.get("scores") or [None] * len(df_out)
+
+csv_bytes = df_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+st.download_button("Download CSV (with topics)", data=csv_bytes, file_name="topics_output.csv", mime="text/csv")
+
+rows = []
+if result["kind"] == "LDA":
+    for r in result["topics"]:
+        tid = int(r["topic_id"])
+        for i, (w, wt) in enumerate(zip(r["words"], r["weights"]), start=1):
+            rows.append({"Topic_ID": tid, "Rank": i, "Word": w, "Weight": float(wt)})
+else:
+    for tid, words in (result.get("topic_words") or {}).items():
+        tid_int = int(tid)
+        for i, w in enumerate(list(words), start=1):
+            rows.append({"Topic_ID": tid_int, "Rank": i, "Word": w})
+topics_csv = pd.DataFrame(rows).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+st.download_button("Download Topic Words CSV", data=topics_csv, file_name="topic_words.csv", mime="text/csv")
+
+st.markdown("---")
+st.subheader("Multidimensional Scaling (MDS)")
+
+if result["kind"] != "LDA":
+    st.info("MDS 可视化仅适用于 LDA。请先选择 Model = LDA 并运行。")
+else:
+    c_mds1, c_mds2, c_mds3, c_mds4 = st.columns(4)
+    with c_mds1:
+        prob_th = st.number_input("特征词概率阈值（≥）", min_value=0.0001, max_value=0.2, value=0.0035, step=0.0005, format="%.4f")
+    with c_mds2:
+        max_words = st.slider("最大显示词数", min_value=100, max_value=1200, value=500, step=50)
+    with c_mds3:
+        do_labels = st.checkbox("显示文字标签", value=False)
+    with c_mds4:
+        label_top_n = st.slider("标注词数", min_value=20, max_value=500, value=150, step=10, disabled=not do_labels)
+
+    if st.button("生成 MDS 图", key="run_lda_mds"):
+        df_mds, mds_err = _safe_action(
+            "生成 MDS 图",
+            lambda: lda_mds_word_map(
+                result["lda_bundle"],
+                prob_threshold=float(prob_th),
+                max_words=int(max_words),
+                random_state=42,
+            ),
+        )
+        if mds_err:
+            st.error(mds_err)
+            st.stop()
+        st.session_state.lda_mds_df = df_mds
+        st.session_state.lda_mds_cfg = {"prob_th": float(prob_th), "max_words": int(max_words), "labels": bool(do_labels), "label_top_n": int(label_top_n)}
+
+    df_mds = st.session_state.get("lda_mds_df")
+    if df_mds is not None and not df_mds.empty:
+        cfg = st.session_state.get("lda_mds_cfg") or {}
+        df_plot = df_mds.copy()
+        df_plot["Topic"] = df_plot["topic_id"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
+        fig_mds = px.scatter(
+            df_plot,
+            x="x",
+            y="y",
+            color="Topic",
+            hover_data=["word", "prob", "topic_id"],
+            title=f"MDS Word Map (threshold≥{cfg.get('prob_th')}, max_words={cfg.get('max_words')})",
+        )
+
+        if cfg.get("labels"):
+            n = int(cfg.get("label_top_n") or 150)
+            df_labels = df_plot.sort_values("prob", ascending=False).head(n)
+            fig_mds.add_trace(
+                go.Scatter(
+                    x=df_labels["x"],
+                    y=df_labels["y"],
+                    mode="text",
+                    text=df_labels["word"],
+                    textposition="top center",
+                    textfont=dict(size=11),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+        st.plotly_chart(fig_mds, use_container_width=True)
+
+        mds_csv = df_plot.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("Download MDS CSV", data=mds_csv, file_name="lda_mds_words.csv", mime="text/csv")
+
+st.markdown("---")
+st.subheader("Sankey (Topic Evolution)")
+
+if time_col != "(none)" and time_col in df_out.columns:
+    freq = st.selectbox("Time grain", options=["M", "Q", "Y"], index=0)
+    sim_th = st.slider("Similarity threshold", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
+    min_docs = st.slider("Min docs per period", min_value=1, max_value=200, value=10, step=1)
+    if st.button("Build Sankey"):
+        if result["kind"] == "LDA":
+            lda_words = {r["topic_id"]: r["words"] for r in result["topics"]}
+            sank, sank_err = _safe_action(
+                "生成演化桑基图",
+                lambda: build_topic_evolution_sankey(
+                    df_out,
+                    time_col=time_col,
+                    topic_col="Topic_ID",
+                    top_words_by_topic=lda_words,
+                    freq=freq,
+                    similarity_threshold=float(sim_th),
+                    min_docs_per_period=int(min_docs),
+                ),
+            )
+        else:
+            bt_words = {int(tid): words for tid, words in (result.get("topic_words") or {}).items()}
+            sank, sank_err = _safe_action(
+                "生成演化桑基图",
+                lambda: build_topic_evolution_sankey(
+                    df_out,
+                    time_col=time_col,
+                    topic_col="Topic_ID",
+                    top_words_by_topic=bt_words,
+                    freq=freq,
+                    similarity_threshold=float(sim_th),
+                    min_docs_per_period=int(min_docs),
+                ),
+            )
+        if sank_err:
+            st.error(sank_err)
+            st.stop()
+        st.session_state.sankey = sank
+
+    sank = st.session_state.get("sankey")
+    if sank:
+        fig_s = go.Figure(
+            data=[
+                go.Sankey(
+                    node=dict(label=sank["labels"], pad=12, thickness=12),
+                    link=dict(source=sank["sources"], target=sank["targets"], value=sank["values"]),
+                )
+            ]
+        )
+        fig_s.update_layout(height=650)
+        st.plotly_chart(fig_s, use_container_width=True)
+else:
+    st.info("选择一个时间列后可生成演化桑基图。")
