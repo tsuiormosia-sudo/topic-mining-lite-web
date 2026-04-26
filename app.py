@@ -31,10 +31,58 @@ def _reset_all():
     st.rerun()
 
 
+def _decode_best_effort(data: bytes) -> str:
+    if not data:
+        return ""
+
+    candidates = []
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        candidates.extend(["utf-16"])
+    if data.startswith(b"\xef\xbb\xbf"):
+        candidates.extend(["utf-8-sig"])
+    candidates.extend(["utf-8", "utf-8-sig", "utf-16", "cp1252", "latin1"])
+
+    best_text = None
+    best_score = None
+    for enc in candidates:
+        try:
+            txt = data.decode(enc, errors="replace")
+        except Exception:
+            continue
+        rep = txt.count("\ufffd")
+        ctrl = sum(1 for ch in txt if unicodedata.category(ch) in {"Cc", "Cf"} and ch not in "\n\t\r")
+        weird = txt.count("ï»¿")
+        score = rep * 10 + ctrl * 2 + weird * 5
+        if best_score is None or score < best_score:
+            best_text = txt
+            best_score = score
+        if score == 0:
+            break
+
+    return best_text if best_text is not None else data.decode("utf-8", errors="replace")
+
+
+def read_csv_smart(uploaded_file):
+    try:
+        data = uploaded_file.getvalue()
+    except Exception:
+        data = uploaded_file.read()
+    text = _decode_best_effort(data)
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        return df, None
+    except Exception:
+        try:
+            df = pd.read_csv(io.StringIO(text))
+            return df, None
+        except Exception as e:
+            return None, f"CSV 读取失败（已尝试自动识别编码/分隔符）：{e}"
+
+
 def read_uploaded_table(uploaded_file):
     suffix = (uploaded_file.name or "").lower()
     if suffix.endswith(".csv"):
-        return pd.read_csv(uploaded_file), None
+        return read_csv_smart(uploaded_file)
     if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
         return pd.read_excel(uploaded_file), None
     return None, "仅支持 CSV / XLSX / XLS 文件"
@@ -152,6 +200,27 @@ def demojize_if_available(text: str) -> str:
             s = re.sub(rf"\\b{k}\\b", f" {v} ", s)
         s = re.sub(r"\\s{2,}", " ", s).strip()
         return s
+    except Exception:
+        return text
+
+
+def ftfy_available() -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("ftfy") is not None
+    except Exception:
+        return False
+
+
+def fix_mojibake_if_available(text: str) -> str:
+    try:
+        import ftfy
+    except Exception:
+        return text
+
+    try:
+        return ftfy.fix_text(text)
     except Exception:
         return text
 
@@ -321,6 +390,7 @@ def preprocess_texts(
     extra_stopwords: List[str] | None = None,
     language: Literal["auto", "en", "zh", "mixed"] = "auto",
     emoji_to_words: bool = True,
+    fix_mojibake: bool = True,
     min_token_len: int = 4,
     keep_nouns_adjs_only: bool = False,
 ) -> Tuple[List[List[str]], List[str], Literal["en", "zh", "mixed"]]:
@@ -354,7 +424,11 @@ def preprocess_texts(
     tokens = []
     joined = []
     for t in texts:
-        raw = demojize_if_available(str(t)) if emoji_to_words else str(t)
+        raw = str(t)
+        if fix_mojibake:
+            raw = fix_mojibake_if_available(raw)
+        if emoji_to_words:
+            raw = demojize_if_available(raw)
         n = normalize_text(raw)
         toks = [x for x in tokenize(n, lang) if x not in stop_set]
         try:
@@ -972,6 +1046,7 @@ with c_cfg:
     time_col = st.selectbox("Time column (optional, for Sankey)", options=["(none)"] + all_cols, index=0)
     language = st.selectbox("Language", options=["auto", "en", "zh", "mixed"], index=0)
     emoji_to_words = st.checkbox("Emoji 转文字", value=True, help="把 😀 🎉 ❤️ 等转成可建模的词（若环境缺少 emoji 库，会自动跳过）。")
+    fix_mojibake = st.checkbox("修复英文乱码(ftfy)", value=True, help="修复 â€™ 这类编码混乱导致的乱码（若环境缺少 ftfy 库，会自动跳过）。")
     keep_nouns_adjs_only = st.checkbox("仅保留名词/形容词（近似）", value=True, help="不装 NLP 大库的前提下用启发式过滤动词/助动词。")
     min_token_len = st.slider("英文最小词长", min_value=2, max_value=10, value=5, step=1, help="减少 eady/oom/expe/champag 这类碎词（中文不受影响）。")
     readable_en_only = st.checkbox("输出仅显示可读英文词", value=True, help="用 wordfreq 过滤疑似乱码/截断碎词（没有该库时会自动降级）。")
@@ -1010,6 +1085,7 @@ tokenized, joined, detected_lang = preprocess_texts(
     extra_stopwords=stopwords,
     language=language,
     emoji_to_words=bool(emoji_to_words),
+    fix_mojibake=bool(fix_mojibake),
     min_token_len=int(min_token_len),
     keep_nouns_adjs_only=bool(keep_nouns_adjs_only),
 )
@@ -1045,6 +1121,7 @@ current_sig = make_signature(
         "text_col": text_col,
         "language": language,
         "emoji_to_words": bool(emoji_to_words),
+        "fix_mojibake": bool(fix_mojibake),
         "keep_nouns_adjs_only": bool(keep_nouns_adjs_only),
         "min_token_len": int(min_token_len),
         "readable_en_only": bool(readable_en_only),
