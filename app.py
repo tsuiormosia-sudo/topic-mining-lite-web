@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import unicodedata
 
 
 st.set_page_config(page_title="Topic Mining Lite (LDA + BERTopic-lite)", layout="wide")
@@ -39,10 +40,10 @@ def read_uploaded_table(uploaded_file):
 def normalize_text(text: object) -> str:
     if not isinstance(text, str):
         return ""
-    s = text.lower()
+    s = unicodedata.normalize("NFKC", text).lower()
     s = re.sub(r"https?://\\S+|www\\.\\S+", " ", s)
-    s = re.sub(r"@[\\w_]+", " ", s)
-    s = re.sub(r"#[\\w_]+", " ", s)
+    s = re.sub(r"@([\\w_]+)", " ", s)
+    s = re.sub(r"#([\\w_]+)", r" \\1 ", s)
     s = re.sub(r"[\\r\\n\\t]+", " ", s)
     s = re.sub(r"[^a-z0-9\\u4e00-\\u9fff ]+", " ", s)
     s = re.sub(r"\\s{2,}", " ", s).strip()
