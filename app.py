@@ -196,6 +196,15 @@ def build_analysis_text(df: pd.DataFrame, text_col: str | None) -> pd.DataFrame:
     return out
 
 
+def gensim_available() -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("gensim") is not None
+    except Exception:
+        return False
+
+
 def run_lda(
     tokenized_docs: List[List[str]],
     num_topics: int = 8,
@@ -209,61 +218,131 @@ def run_lda(
     keep_n: int = 20000,
     minimum_probability: float = 0.0,
 ):
-    from gensim import corpora
-    from gensim.models import LdaModel
-
     docs = [d for d in tokenized_docs if d]
     if not docs:
         return None, "No valid tokens for LDA"
 
-    dictionary = corpora.Dictionary(docs)
-    dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
-    if len(dictionary) == 0:
-        return None, "Empty dictionary after filtering. Try lowering min_df/stopwords."
-
-    corpus = [dictionary.doc2bow(d) for d in docs]
-    if not any(len(x) > 0 for x in corpus):
-        return None, "Empty corpus after filtering."
-
     k = int(max(2, min(int(num_topics), 60)))
-    model = LdaModel(
-        corpus=corpus,
-        id2word=dictionary,
-        num_topics=k,
-        passes=int(max(1, passes)),
-        alpha=alpha,
-        eta=float(eta),
-        random_state=int(random_state),
-        iterations=int(max(30, iterations)),
-        eval_every=None,
-        minimum_probability=float(minimum_probability),
+    if gensim_available():
+        from gensim import corpora
+        from gensim.models import LdaModel
+
+        dictionary = corpora.Dictionary(docs)
+        dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
+        if len(dictionary) == 0:
+            return None, "Empty dictionary after filtering. Try lowering min_df/stopwords."
+
+        corpus = [dictionary.doc2bow(d) for d in docs]
+        if not any(len(x) > 0 for x in corpus):
+            return None, "Empty corpus after filtering."
+
+        model = LdaModel(
+            corpus=corpus,
+            id2word=dictionary,
+            num_topics=k,
+            passes=int(max(1, passes)),
+            alpha=alpha,
+            eta=float(eta),
+            random_state=int(random_state),
+            iterations=int(max(30, iterations)),
+            eval_every=None,
+            minimum_probability=float(minimum_probability),
+        )
+        phi = model.get_topics()
+        terms = [dictionary[i] for i in range(int(phi.shape[1]))]
+        doc_topic = np.zeros((len(corpus), k), dtype=float)
+        for i, bow in enumerate(corpus):
+            dist = model.get_document_topics(bow, minimum_probability=0.0)
+            for tid, p in dist:
+                doc_topic[i, int(tid)] = float(p)
+
+        return {
+            "engine": "gensim",
+            "model": model,
+            "dictionary": dictionary,
+            "corpus": corpus,
+            "num_topics": k,
+            "phi": phi,
+            "terms": terms,
+            "doc_topic": doc_topic,
+        }, None
+
+    from sklearn.decomposition import LatentDirichletAllocation
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    texts = [" ".join(d) for d in docs]
+    vectorizer = CountVectorizer(
+        token_pattern=r"(?u)\b\w+\b",
+        min_df=int(no_below),
+        max_df=float(no_above),
     )
-    return {"model": model, "dictionary": dictionary, "corpus": corpus, "num_topics": k}, None
+    X = vectorizer.fit_transform(texts)
+    if X.shape[1] == 0:
+        return None, "Empty vocabulary after filtering. Try lowering min_df/stopwords."
+
+    alpha_val = None
+    try:
+        alpha_val = float(alpha)
+    except Exception:
+        alpha_val = None
+    eta_val = float(eta)
+
+    model = LatentDirichletAllocation(
+        n_components=k,
+        random_state=int(random_state),
+        learning_method="batch",
+        max_iter=int(max(5, iterations)),
+        doc_topic_prior=alpha_val,
+        topic_word_prior=eta_val,
+    )
+    doc_topic = model.fit_transform(X)
+    components = np.asarray(model.components_, dtype=float)
+    phi = components / np.maximum(components.sum(axis=1, keepdims=True), 1e-12)
+    terms = list(vectorizer.get_feature_names_out())
+
+    return {
+        "engine": "sklearn",
+        "model": model,
+        "vectorizer": vectorizer,
+        "num_topics": k,
+        "phi": phi,
+        "terms": terms,
+        "doc_topic": doc_topic,
+    }, None
 
 
 def lda_topics(lda_bundle, topn: int = 50) -> List[Dict]:
     model = lda_bundle["model"]
+    engine = str(lda_bundle.get("engine") or "gensim")
     rows = []
-    for tid in range(int(lda_bundle["num_topics"])):
-        words = model.show_topic(tid, topn=int(topn))
-        rows.append({"topic_id": tid, "words": [w for w, _ in words], "weights": [float(p) for _, p in words]})
+    k = int(lda_bundle["num_topics"])
+    if engine == "gensim":
+        for tid in range(k):
+            words = model.show_topic(tid, topn=int(topn))
+            rows.append({"topic_id": tid, "words": [w for w, _ in words], "weights": [float(p) for _, p in words]})
+        return rows
+
+    phi = np.asarray(lda_bundle["phi"], dtype=float)
+    terms = list(lda_bundle["terms"])
+    for tid in range(k):
+        weights = phi[tid]
+        idx = np.argsort(weights)[::-1][: int(topn)]
+        rows.append(
+            {
+                "topic_id": tid,
+                "words": [str(terms[int(i)]) for i in idx.tolist()],
+                "weights": [float(weights[int(i)]) for i in idx.tolist()],
+            }
+        )
     return rows
 
 
 def lda_assignments(lda_bundle) -> Tuple[List[int], List[float]]:
-    model = lda_bundle["model"]
-    corpus = lda_bundle["corpus"]
-    labels = []
-    scores = []
-    for bow in corpus:
-        dist = model.get_document_topics(bow, minimum_probability=0.0)
-        if not dist:
-            labels.append(0)
-            scores.append(0.0)
-            continue
-        best = max(dist, key=lambda x: x[1])
-        labels.append(int(best[0]))
-        scores.append(float(best[1]))
+    doc_topic = np.asarray(lda_bundle["doc_topic"], dtype=float)
+    if doc_topic.size == 0:
+        return [], []
+    labels = doc_topic.argmax(axis=1).astype(int).tolist()
+    scores = doc_topic.max(axis=1).astype(float).tolist()
     return labels, scores
 
 
@@ -276,9 +355,7 @@ def lda_mds_word_map(
     from sklearn.manifold import MDS
     from sklearn.metrics.pairwise import cosine_distances
 
-    model = lda_bundle["model"]
-    dictionary = lda_bundle["dictionary"]
-    phi = model.get_topics()
+    phi = np.asarray(lda_bundle["phi"], dtype=float)
     if phi is None or phi.size == 0:
         return None, "Empty topic-word distribution"
 
@@ -288,7 +365,9 @@ def lda_mds_word_map(
         return None, "max_words must be > 0"
 
     vocab_size = int(phi.shape[1])
-    terms = [dictionary[i] for i in range(vocab_size)]
+    terms = list(lda_bundle["terms"])
+    if len(terms) != vocab_size:
+        return None, "Vocabulary size mismatch"
     phi_t = phi.T
 
     best_topic = np.argmax(phi_t, axis=1).astype(int)
@@ -341,9 +420,6 @@ def lda_tune_k_alpha_light(
     no_above: float = 0.9,
     keep_n: int = 20000,
 ):
-    from gensim import corpora
-    from gensim.models import CoherenceModel, LdaModel
-
     docs = [d for d in tokenized_docs if d]
     if not docs:
         return None, "No valid tokens for tuning"
@@ -353,24 +429,16 @@ def lda_tune_k_alpha_light(
         idx = rng.choice(len(docs), size=int(sample_size), replace=False)
         docs = [docs[int(i)] for i in idx.tolist()]
 
-    dictionary = corpora.Dictionary(docs)
-    dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
-    if len(dictionary) == 0:
-        return None, "Empty dictionary after filtering"
-
-    corpus = [dictionary.doc2bow(d) for d in docs]
-    if not any(len(x) > 0 for x in corpus):
-        return None, "Empty corpus after filtering"
-
     k_values = sorted({int(k) for k in k_values if int(k) >= 2})
     if not k_values:
         return None, "k_values empty"
 
     cleaned_alphas: List[str | float] = []
     for a in alpha_values:
-        if isinstance(a, str) and a in {"auto", "symmetric", "asymmetric"}:
-            cleaned_alphas.append(a)
-            continue
+        if gensim_available():
+            if isinstance(a, str) and a in {"auto", "symmetric", "asymmetric"}:
+                cleaned_alphas.append(a)
+                continue
         try:
             cleaned_alphas.append(float(a))
         except Exception:
@@ -379,26 +447,76 @@ def lda_tune_k_alpha_light(
         return None, "alpha_values empty"
 
     rows = []
-    for k in k_values:
-        for alpha in cleaned_alphas:
-            try:
-                model = LdaModel(
-                    corpus=corpus,
-                    id2word=dictionary,
-                    num_topics=int(k),
-                    passes=int(max(1, passes)),
-                    alpha=alpha,
-                    eta=float(eta),
-                    random_state=int(random_state),
-                    iterations=int(max(30, iterations)),
-                    eval_every=None,
-                    minimum_probability=0.0,
-                )
-                cm = CoherenceModel(model=model, texts=docs, dictionary=dictionary, coherence=str(coherence))
-                score = float(cm.get_coherence())
-                rows.append({"k": int(k), "alpha": str(alpha), "coherence": score})
-            except Exception as e:
-                rows.append({"k": int(k), "alpha": str(alpha), "coherence": None, "error": str(e)})
+    if gensim_available():
+        from gensim import corpora
+        from gensim.models import CoherenceModel, LdaModel
+
+        dictionary = corpora.Dictionary(docs)
+        dictionary.filter_extremes(no_below=int(no_below), no_above=float(no_above), keep_n=int(keep_n))
+        if len(dictionary) == 0:
+            return None, "Empty dictionary after filtering"
+
+        corpus = [dictionary.doc2bow(d) for d in docs]
+        if not any(len(x) > 0 for x in corpus):
+            return None, "Empty corpus after filtering"
+
+        for k in k_values:
+            for alpha in cleaned_alphas:
+                try:
+                    model = LdaModel(
+                        corpus=corpus,
+                        id2word=dictionary,
+                        num_topics=int(k),
+                        passes=int(max(1, passes)),
+                        alpha=alpha,
+                        eta=float(eta),
+                        random_state=int(random_state),
+                        iterations=int(max(30, iterations)),
+                        eval_every=None,
+                        minimum_probability=0.0,
+                    )
+                    cm = CoherenceModel(model=model, texts=docs, dictionary=dictionary, coherence=str(coherence))
+                    score = float(cm.get_coherence())
+                    rows.append({"k": int(k), "alpha": str(alpha), "coherence": score})
+                except Exception as e:
+                    rows.append({"k": int(k), "alpha": str(alpha), "coherence": None, "error": str(e)})
+    else:
+        from sklearn.decomposition import LatentDirichletAllocation
+        from sklearn.feature_extraction.text import CountVectorizer
+
+        texts = [" ".join(d) for d in docs]
+        vectorizer = CountVectorizer(
+            token_pattern=r"(?u)\b\w+\b",
+            min_df=int(no_below),
+            max_df=float(no_above),
+        )
+        X = vectorizer.fit_transform(texts)
+        if X.shape[1] == 0:
+            return None, "Empty vocabulary after filtering"
+
+        n_docs = X.shape[0]
+        if n_docs < 10:
+            return None, "Need at least 10 docs for tuning"
+        split = int(max(5, np.floor(n_docs * 0.8)))
+        X_train = X[:split]
+        X_test = X[split:]
+
+        for k in k_values:
+            for alpha in cleaned_alphas:
+                try:
+                    model = LatentDirichletAllocation(
+                        n_components=int(k),
+                        random_state=int(random_state),
+                        learning_method="batch",
+                        max_iter=int(max(5, iterations)),
+                        doc_topic_prior=float(alpha),
+                        topic_word_prior=float(eta),
+                    )
+                    model.fit(X_train)
+                    perp = float(model.perplexity(X_test))
+                    rows.append({"k": int(k), "alpha": str(alpha), "coherence": -perp})
+                except Exception as e:
+                    rows.append({"k": int(k), "alpha": str(alpha), "coherence": None, "error": str(e)})
 
     df = pd.DataFrame(rows)
     ok = df.dropna(subset=["coherence"]).copy()
@@ -622,7 +740,10 @@ st.caption(f"Detected language: {detected_lang}")
 st.caption(f"Valid docs: {len(df_valid)} / {len(df)}")
 
 if model_kind == "LDA":
-    with st.expander("轻量调参：寻找最优 K 与 alpha（Coherence c_v）", expanded=False):
+    tune_metric_title = "Coherence (c_v)" if gensim_available() else "(- Perplexity)"
+    with st.expander(f"轻量调参：寻找最优 K 与 alpha（{tune_metric_title}）", expanded=False):
+        if not gensim_available():
+            st.caption("当前环境未安装 gensim，将使用 scikit-learn LDA 以 Perplexity 近似调参（数值越大越好=负 Perplexity）。")
         t_col1, t_col2, t_col3 = st.columns(3)
         with t_col1:
             tune_k_min = st.slider("K min", min_value=2, max_value=30, value=2, step=1, key="tune_k_min")
@@ -633,10 +754,12 @@ if model_kind == "LDA":
         tune_sample = st.slider("Sample docs（加速）", min_value=100, max_value=2000, value=800, step=100, key="tune_sample")
         tune_passes = st.slider("Tuning passes（加速）", min_value=1, max_value=10, value=4, step=1, key="tune_passes")
         tune_iterations = st.slider("Tuning iterations（加速）", min_value=30, max_value=200, value=80, step=10, key="tune_iterations")
+        alpha_options = ["auto", "symmetric", "asymmetric", "0.1", "0.5", "1.0"] if gensim_available() else ["0.05", "0.1", "0.2", "0.5", "1.0"]
+        alpha_default = ["auto", "symmetric", "asymmetric"] if gensim_available() else ["0.1", "0.2", "0.5"]
         tune_alpha_candidates = st.multiselect(
             "Alpha candidates",
-            options=["auto", "symmetric", "asymmetric", "0.1", "0.5", "1.0"],
-            default=["auto", "symmetric", "asymmetric"],
+            options=alpha_options,
+            default=alpha_default,
             key="tune_alpha_candidates",
         )
         if st.button("Run tuning", key="run_tuning_btn"):
@@ -677,7 +800,7 @@ if model_kind == "LDA":
             st.dataframe(show, use_container_width=True, hide_index=True)
             ok = show.dropna(subset=["coherence"])
             if not ok.empty:
-                fig_tune = px.line(ok, x="k", y="coherence", color="alpha", markers=True, title="Coherence (c_v) by K and alpha")
+                fig_tune = px.line(ok, x="k", y="coherence", color="alpha", markers=True, title=f"{tune_metric_title} by K and alpha")
                 st.plotly_chart(fig_tune, use_container_width=True)
             if st.button("Apply best K/alpha", key="apply_best_btn"):
                 try:
