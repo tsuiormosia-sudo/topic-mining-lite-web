@@ -1,3 +1,4 @@
+import io
 import re
 import time
 from typing import Dict, List, Literal, Tuple
@@ -37,6 +38,61 @@ def read_uploaded_table(uploaded_file):
     if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
         return pd.read_excel(uploaded_file), None
     return None, "仅支持 CSV / XLSX / XLS 文件"
+
+
+def parse_pasted_table(
+    raw_text: str,
+    delimiter: Literal["auto", "tab", "comma", "semicolon"] = "auto",
+    first_row_header: bool = True,
+):
+    text = (raw_text or "").strip()
+    if not text:
+        return None, "粘贴内容为空"
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None, "粘贴内容为空"
+
+    first = lines[0]
+    sep = None
+    if delimiter == "tab":
+        sep = "\t"
+    elif delimiter == "comma":
+        sep = ","
+    elif delimiter == "semicolon":
+        sep = ";"
+    else:
+        if "\t" in first:
+            sep = "\t"
+        elif "," in first:
+            sep = ","
+        elif ";" in first:
+            sep = ";"
+
+    if sep is None:
+        values = [ln.strip() for ln in lines if ln.strip()]
+        df = pd.DataFrame({"text": values})
+        return df, None
+
+    try:
+        df = pd.read_csv(
+            io.StringIO("\n".join(lines)),
+            sep=sep,
+            header=0 if first_row_header else None,
+            engine="python",
+        )
+    except Exception as e:
+        return None, f"解析失败：{e}"
+
+    if df is None or df.empty:
+        return None, "解析成功但表格为空"
+
+    if not first_row_header:
+        df.columns = [f"col_{i+1}" for i in range(df.shape[1])]
+        if df.shape[1] == 1:
+            df = df.rename(columns={"col_1": "text"})
+
+    return df, None
 
 def make_signature(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -773,15 +829,35 @@ st.title("Topic Mining Lite (LDA + BERTopic-lite)")
 
 with st.sidebar:
     st.header("Data")
-    uploaded = st.file_uploader("Upload CSV / Excel", type=["csv", "xlsx", "xls"])
+    data_mode = st.radio("数据来源", options=["上传文件", "粘贴表格"], index=0)
+    uploaded = None
+    pasted_text = ""
+    paste_delim: Literal["auto", "tab", "comma", "semicolon"] = "auto"
+    paste_header = True
+    if data_mode == "上传文件":
+        uploaded = st.file_uploader("Upload CSV / Excel", type=["csv", "xlsx", "xls"])
+    else:
+        pasted_text = st.text_area("粘贴表格（支持 Excel 直接复制）", value="", height=220)
+        paste_header = st.checkbox("首行是表头", value=True)
+        paste_delim = st.selectbox("分隔符", options=["auto", "tab", "comma", "semicolon"], index=0)
     if st.button("Reset App", type="secondary"):
         _reset_all()
 
-if uploaded is None:
-    st.info("先上传一个包含文本列的 CSV / XLSX 文件。")
-    st.stop()
-
-df_raw, err = _safe_action("读取上传文件", lambda: read_uploaded_table(uploaded))
+if data_mode == "上传文件":
+    if uploaded is None:
+        st.info("先上传一个包含文本列的 CSV / XLSX 文件，或切换到“粘贴表格”。")
+        st.stop()
+    df_raw, err = _safe_action("读取上传文件", lambda: read_uploaded_table(uploaded))
+    data_descriptor = {"mode": "upload", "name": getattr(uploaded, "name", None), "size": getattr(uploaded, "size", None)}
+else:
+    if not (pasted_text or "").strip():
+        st.info("把要分析的表格粘贴进来（支持 Excel 复制），或切换到“上传文件”。")
+        st.stop()
+    df_raw, err = _safe_action(
+        "解析粘贴表格",
+        lambda: parse_pasted_table(pasted_text, delimiter=paste_delim, first_row_header=bool(paste_header)),
+    )
+    data_descriptor = {"mode": "paste", "hash": hashlib.sha1((pasted_text or "").encode("utf-8")).hexdigest()}
 if err:
     st.error(err)
     st.stop()
@@ -868,7 +944,7 @@ st.caption(f"Valid docs: {len(df_valid)} / {len(df)}")
 
 current_sig = make_signature(
     {
-        "file": {"name": getattr(uploaded, "name", None), "size": getattr(uploaded, "size", None)},
+        "data": data_descriptor,
         "text_col": text_col,
         "language": language,
         "emoji_to_words": bool(emoji_to_words),
