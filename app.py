@@ -102,7 +102,7 @@ def make_signature(payload: dict) -> str:
 def normalize_text(text: object) -> str:
     if not isinstance(text, str):
         return ""
-    s = unicodedata.normalize("NFKC", text)
+    s = unicodedata.normalize("NFKD", text)
     s = "".join(
         ch
         for ch in s
@@ -201,6 +201,77 @@ def keep_nouns_adjs_heuristic(tokens: List[str]) -> List[str]:
             continue
         out.append(t)
     return out
+
+
+def wordfreq_available() -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("wordfreq") is not None
+    except Exception:
+        return False
+
+
+def zipf_en(token: str) -> float | None:
+    try:
+        from wordfreq import zipf_frequency
+
+        return float(zipf_frequency(token, "en"))
+    except Exception:
+        return None
+
+
+def is_readable_en_token(token: str, zipf_threshold: float) -> bool:
+    t = (token or "").strip().lower()
+    if not t:
+        return False
+
+    allow = {"vegas", "las_vegas", "lasvegas", "casa_playa", "casaplaya"}
+    if t in allow:
+        return True
+
+    if not re.fullmatch(r"[a-z_]{3,40}", t):
+        return False
+
+    if "_" in t:
+        parts = [p for p in t.split("_") if p]
+        if len(parts) < 2:
+            return False
+        return all(is_readable_en_token(p, zipf_threshold) for p in parts)
+
+    z = zipf_en(t)
+    if z is not None:
+        return z >= float(zipf_threshold)
+
+    if not re.search(r"[aeiouy]", t):
+        return False
+    if t.endswith(("ing", "ed")) and len(t) >= 6:
+        return False
+    if t in _COMMON_EN_VERBS:
+        return False
+    return True
+
+
+def filter_topic_words(
+    words: List[str],
+    weights: List[float] | None,
+    readable_en_only: bool,
+    zipf_threshold: float,
+):
+    if not readable_en_only:
+        return words, weights
+
+    out_w = []
+    out_p = [] if weights is not None else None
+    for i, w in enumerate(words):
+        s = str(w)
+        if re.fullmatch(r"[a-z_]{3,40}", s.lower()):
+            if not is_readable_en_token(s, float(zipf_threshold)):
+                continue
+        out_w.append(s)
+        if out_p is not None:
+            out_p.append(float(weights[i]))
+    return out_w, out_p
 
 
 def _zh_char_ngrams(s: str, n: int) -> List[str]:
@@ -484,7 +555,12 @@ def run_lda(
     }, None
 
 
-def lda_topics(lda_bundle, topn: int = 50) -> List[Dict]:
+def lda_topics(
+    lda_bundle,
+    topn: int = 50,
+    readable_en_only: bool = False,
+    zipf_threshold: float = 2.5,
+) -> List[Dict]:
     model = lda_bundle["model"]
     engine = str(lda_bundle.get("engine") or "gensim")
     rows = []
@@ -492,7 +568,15 @@ def lda_topics(lda_bundle, topn: int = 50) -> List[Dict]:
     if engine == "gensim":
         for tid in range(k):
             words = model.show_topic(tid, topn=int(topn))
-            rows.append({"topic_id": tid, "words": [w for w, _ in words], "weights": [float(p) for _, p in words]})
+            w_list = [w for w, _ in words]
+            p_list = [float(p) for _, p in words]
+            w_list, p_list = filter_topic_words(
+                w_list,
+                p_list,
+                readable_en_only=bool(readable_en_only),
+                zipf_threshold=float(zipf_threshold),
+            )
+            rows.append({"topic_id": tid, "words": w_list, "weights": p_list or []})
         return rows
 
     phi = np.asarray(lda_bundle["phi"], dtype=float)
@@ -500,13 +584,15 @@ def lda_topics(lda_bundle, topn: int = 50) -> List[Dict]:
     for tid in range(k):
         weights = phi[tid]
         idx = np.argsort(weights)[::-1][: int(topn)]
-        rows.append(
-            {
-                "topic_id": tid,
-                "words": [str(terms[int(i)]) for i in idx.tolist()],
-                "weights": [float(weights[int(i)]) for i in idx.tolist()],
-            }
+        w_list = [str(terms[int(i)]) for i in idx.tolist()]
+        p_list = [float(weights[int(i)]) for i in idx.tolist()]
+        w_list, p_list = filter_topic_words(
+            w_list,
+            p_list,
+            readable_en_only=bool(readable_en_only),
+            zipf_threshold=float(zipf_threshold),
         )
+        rows.append({"topic_id": tid, "words": w_list, "weights": p_list or []})
     return rows
 
 
@@ -709,6 +795,8 @@ def run_bertopic_lite(
     max_df: float = 0.95,
     random_state: int = 42,
     topn_words: int = 50,
+    readable_en_only: bool = False,
+    zipf_threshold: float = 2.5,
 ):
     from sklearn.cluster import KMeans
     from sklearn.decomposition import TruncatedSVD
@@ -746,7 +834,14 @@ def run_bertopic_lite(
             continue
         tfidf_sum = np.asarray(X[mask].sum(axis=0)).reshape(-1)
         top_idx = np.argsort(tfidf_sum)[::-1][: min(topn, len(terms))]
-        topic_words[tid] = [str(t) for t in terms[top_idx] if str(t).strip()]
+        words = [str(t) for t in terms[top_idx] if str(t).strip()]
+        words, _ = filter_topic_words(
+            words,
+            None,
+            readable_en_only=bool(readable_en_only),
+            zipf_threshold=float(zipf_threshold),
+        )
+        topic_words[tid] = words
 
     doc_2d = Xr[:, :2] if Xr.shape[1] >= 2 else np.hstack([Xr, np.zeros((Xr.shape[0], 1))])
     return {
@@ -877,8 +972,10 @@ with c_cfg:
     time_col = st.selectbox("Time column (optional, for Sankey)", options=["(none)"] + all_cols, index=0)
     language = st.selectbox("Language", options=["auto", "en", "zh", "mixed"], index=0)
     emoji_to_words = st.checkbox("Emoji 转文字", value=True, help="把 😀 🎉 ❤️ 等转成可建模的词（若环境缺少 emoji 库，会自动跳过）。")
-    keep_nouns_adjs_only = st.checkbox("仅保留名词/形容词（近似）", value=False, help="不装 NLP 大库的前提下用启发式过滤动词/助动词。")
-    min_token_len = st.slider("英文最小词长", min_value=2, max_value=8, value=4, step=1, help="减少 eady/oom 这类碎词（中文不受影响）。")
+    keep_nouns_adjs_only = st.checkbox("仅保留名词/形容词（近似）", value=True, help="不装 NLP 大库的前提下用启发式过滤动词/助动词。")
+    min_token_len = st.slider("英文最小词长", min_value=2, max_value=10, value=5, step=1, help="减少 eady/oom/expe/champag 这类碎词（中文不受影响）。")
+    readable_en_only = st.checkbox("输出仅显示可读英文词", value=True, help="用 wordfreq 过滤疑似乱码/截断碎词（没有该库时会自动降级）。")
+    zipf_threshold = st.slider("英文可读阈值（Zipf）", min_value=1.5, max_value=5.5, value=2.5, step=0.1, help="越高越严格，可能会过滤专有名词。", disabled=not readable_en_only)
     extra_sw = st.text_area("Extra stopwords (comma separated)", value="", height=80)
     high_df = st.slider("删除高频词（出现率≥%）", min_value=50, max_value=100, value=80, step=5, help="100 表示关闭该过滤")
     top_words_n = st.slider("每个主题展示高频词数量", min_value=30, max_value=300, value=80, step=10)
@@ -950,6 +1047,8 @@ current_sig = make_signature(
         "emoji_to_words": bool(emoji_to_words),
         "keep_nouns_adjs_only": bool(keep_nouns_adjs_only),
         "min_token_len": int(min_token_len),
+        "readable_en_only": bool(readable_en_only),
+        "zipf_threshold": float(zipf_threshold) if readable_en_only else None,
         "stopwords": stopwords,
         "high_df": int(high_df),
         "model_kind": model_kind,
@@ -1069,7 +1168,12 @@ if run_btn or result is None:
         if lda_err:
             st.error(lda_err)
             st.stop()
-        topics = lda_topics(lda_bundle, topn=int(top_words_n))
+        topics = lda_topics(
+            lda_bundle,
+            topn=int(top_words_n),
+            readable_en_only=bool(readable_en_only),
+            zipf_threshold=float(zipf_threshold) if readable_en_only else 2.5,
+        )
         labels, scores = lda_assignments(lda_bundle)
         st.session_state.topic_result = {"kind": "LDA", "topics": topics, "labels": labels, "scores": scores, "lda_bundle": lda_bundle}
         st.session_state.topic_meta = {"k": int(lda_bundle["num_topics"]), "sig": current_sig, "row_index": df_valid.index.tolist()}
@@ -1086,6 +1190,8 @@ if run_btn or result is None:
                     min_df=int(bt_min_df),
                     max_df=float(bt_max_df),
                     topn_words=int(top_words_n),
+                    readable_en_only=bool(readable_en_only),
+                    zipf_threshold=float(zipf_threshold) if readable_en_only else 2.5,
                 ),
             )
         if bt_err:
