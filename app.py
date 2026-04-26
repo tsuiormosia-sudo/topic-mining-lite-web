@@ -2,6 +2,8 @@ import re
 import time
 from typing import Dict, List, Literal, Tuple
 
+import hashlib
+import json
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -36,6 +38,10 @@ def read_uploaded_table(uploaded_file):
         return pd.read_excel(uploaded_file), None
     return None, "仅支持 CSV / XLSX / XLS 文件"
 
+def make_signature(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
 
 def normalize_text(text: object) -> str:
     if not isinstance(text, str):
@@ -44,7 +50,10 @@ def normalize_text(text: object) -> str:
     s = "".join(
         ch
         for ch in s
-        if not (unicodedata.category(ch) in {"Cf", "Cc"} and ch not in {"\n", "\t", "\r"})
+        if not (
+            (unicodedata.category(ch) in {"Cf", "Cc"} and ch not in {"\n", "\t", "\r"})
+            or unicodedata.category(ch) in {"Mn", "Me"}
+        )
     )
     s = s.lower()
     s = re.sub(r"https?://\\S+|www\\.\\S+", " ", s)
@@ -857,6 +866,31 @@ joined_valid = [t for t in joined if t.strip()]
 st.caption(f"Detected language: {detected_lang}")
 st.caption(f"Valid docs: {len(df_valid)} / {len(df)}")
 
+current_sig = make_signature(
+    {
+        "file": {"name": getattr(uploaded, "name", None), "size": getattr(uploaded, "size", None)},
+        "text_col": text_col,
+        "language": language,
+        "emoji_to_words": bool(emoji_to_words),
+        "keep_nouns_adjs_only": bool(keep_nouns_adjs_only),
+        "min_token_len": int(min_token_len),
+        "stopwords": stopwords,
+        "high_df": int(high_df),
+        "model_kind": model_kind,
+    }
+)
+
+prev_meta = st.session_state.get("topic_meta") or {}
+if prev_meta and prev_meta.get("sig") and prev_meta.get("sig") != current_sig:
+    st.session_state.pop("topic_result", None)
+    st.session_state.pop("topic_meta", None)
+    st.session_state.pop("topic_names", None)
+    st.session_state.pop("lda_mds_df", None)
+    st.session_state.pop("lda_mds_cfg", None)
+    st.session_state.pop("sankey", None)
+    st.warning("配置或预处理已变更：请重新点击 Run Topic Model。")
+    st.stop()
+
 if model_kind == "LDA":
     tune_metric_title = "Coherence (c_v)" if gensim_available() else "(- Perplexity)"
     with st.expander(f"轻量调参：寻找最优 K 与 alpha（{tune_metric_title}）", expanded=False):
@@ -962,7 +996,7 @@ if run_btn or result is None:
         topics = lda_topics(lda_bundle, topn=int(top_words_n))
         labels, scores = lda_assignments(lda_bundle)
         st.session_state.topic_result = {"kind": "LDA", "topics": topics, "labels": labels, "scores": scores, "lda_bundle": lda_bundle}
-        st.session_state.topic_meta = {"k": int(lda_bundle["num_topics"])}
+        st.session_state.topic_meta = {"k": int(lda_bundle["num_topics"]), "sig": current_sig, "row_index": df_valid.index.tolist()}
     else:
         with st.spinner("Training BERTopic-lite..."):
             bt_res, bt_err = _safe_action(
@@ -982,7 +1016,7 @@ if run_btn or result is None:
             st.error(bt_err)
             st.stop()
         st.session_state.topic_result = {"kind": "BERTopic-lite", **bt_res}
-        st.session_state.topic_meta = {"k": int(bt_res["n_topics"])}
+        st.session_state.topic_meta = {"k": int(bt_res["n_topics"]), "sig": current_sig, "row_index": df_valid.index.tolist()}
 
     result = st.session_state.topic_result
     meta = st.session_state.topic_meta
@@ -1053,7 +1087,13 @@ st.markdown("---")
 st.subheader("Export")
 
 labels = result["labels"]
-df_out = df_valid.copy()
+row_index = (meta or {}).get("row_index") or df_valid.index.tolist()
+df_out = df.loc[row_index].copy()
+if len(labels) != len(df_out):
+    st.session_state.pop("topic_result", None)
+    st.session_state.pop("topic_meta", None)
+    st.error("主题结果与当前数据长度不一致：请重新点击 Run Topic Model。")
+    st.stop()
 df_out["Topic_ID"] = labels
 df_out["Topic"] = df_out["Topic_ID"].map(lambda i: topic_names.get(int(i), f"Topic {int(i)+1}"))
 if result["kind"] == "LDA":
