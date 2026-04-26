@@ -1,5 +1,3 @@
-import io
-import os
 import re
 import time
 from typing import Dict, List, Literal, Tuple
@@ -38,7 +36,7 @@ def read_uploaded_table(uploaded_file):
     return None, "仅支持 CSV / XLSX / XLS 文件"
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: object) -> str:
     if not isinstance(text, str):
         return ""
     s = text.lower()
