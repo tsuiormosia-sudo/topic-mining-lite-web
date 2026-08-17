@@ -893,7 +893,28 @@ def _repair_youtube_hyphenation(text: str, lang: Lang) -> str:
         if lang not in {"en", "es"}:
             return text if isinstance(text, str) else ""
         if not isinstance(text, str):
-            return ""
+            try:
+                if text is None:
+                    return ""
+                if isinstance(text, (bytes, bytearray)):
+                    text = text.decode("utf-8", errors="replace")
+                else:
+                    text = str(text)
+            except Exception:
+                return ""
+        # Unicode normalize (YouTube 字幕常把 ñ/á 等拆成 NFC 组合音+重音符两个码位)
+        try:
+            text = _unicodedata.normalize("NFKC", text)
+        except Exception:
+            pass
+        # Surrogate / Latin-1 字节伪对象: 强行用 surrogateescape 编码清理
+        try:
+            text = text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+        except Exception:
+            try:
+                text = text.encode("latin-1", "replace").decode("utf-8", "replace")
+            except Exception:
+                pass
         text = text.strip()
         if not text:
             return text
@@ -1016,12 +1037,37 @@ def _repair_youtube_hyphenation(text: str, lang: Lang) -> str:
                     w = m.group(0)
                     if not isinstance(w, str):
                         return w if isinstance(w, str) else ""
+                    try:
+                        w = _unicodedata.normalize("NFKC", w)
+                    except Exception:
+                        pass
                     low = w.lower()
+                    # 手动尝试 normalize 两种 key (NFKC vs NFD): YouTube 字幕会把 tecnología 拆成 "n~" + "o" 双码位
+                    if low not in es_standalone_fix:
+                        try:
+                            low_nfd = _unicodedata.normalize("NFD", w).lower()
+                            if low_nfd in es_standalone_fix:
+                                return es_standalone_fix[low_nfd]
+                        except Exception:
+                            pass
+                        try:
+                            from unicodedata import normalize as _n2  # noqa: F811
+                            low_nfkd = _n2("NFKD", w).lower()
+                            if low_nfkd in es_standalone_fix:
+                                return es_standalone_fix[low_nfkd]
+                        except Exception:
+                            pass
                     return es_standalone_fix.get(low, w)
                 except Exception:
                     return m.group(0) if isinstance(m.group(0), str) else ""
             try:
-                text = re.sub(r"\b[a-zñáéíóúü]{5,}\b", _es_patch, text)
+                # 1) 标准正则 (ASCII 小写 + 预组合 重音符)
+                text = re.sub(r"\b[a-zñáéíóúü]{5,}\b", _es_patch, text, flags=re.UNICODE)
+            except Exception:
+                pass
+            try:
+                # 2) fallback: 更宽松的正则, 同时接受 [a-z] + 任何 unicode 字母 (\w+ 的 unicode 版)
+                text = re.sub(r"\b[A-Za-z\u00C0-\u024F]{5,}\b", _es_patch, text, flags=re.UNICODE)
             except Exception:
                 pass
 
