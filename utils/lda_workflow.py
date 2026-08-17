@@ -1,19 +1,8 @@
 """
 End-to-end LDA workflow (academic preprocessing + sklearn LDA K-sweep + topic naming + visualisation output writer).
-
-Exposed functions:
-  load_any_table(file_path_or_bytesio, original_name_hint=None)           → (df, err)   — .xls/.xlsx/.csv/.parquet with correct engine auto-select
-  preprocess_for_lda(df, mode='loose_for_youtube', extra_stopwords=None, lang='auto', text_col_hint=None)
-                                                                          → (preprocessed_df, report)
-  run_lda_k_sweep(preprocessed_df, k_list=None, k_defaults=(3,4,5,6,7,8,9,10,12,15), random_state=42)
-                                                                          → (search_df: pd.DataFrame, best_row: dict, turning: dict)
-  train_lda_and_assign(preprocessed_df, K, random_state=42, topn_words=25, auto_name=True)
-                                                                          → (lda, vec, vocab_dict, assignments_df: 1 row/doc, topic_dict_df: 1 row/topic)
-  write_all_outputs(out_dir, preprocessed_df=None, assignments_df=None, topic_dict_df=None, k_sweep_df=None, turning=None,
-                    lda=None, vec=None)                                  → dict with paths (xlsx + csv + json + png)
-
-All errors return (None/empty, err) instead of raising so the Streamlit UI can catch & display.
 """
+from __future__ import annotations
+
 import io, os, re, sys, time, json, traceback
 import numpy as np
 import pandas as pd

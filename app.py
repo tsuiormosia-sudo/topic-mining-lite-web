@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import re
 import time
@@ -86,8 +88,16 @@ def read_uploaded_table(uploaded_file):
     suffix = (uploaded_file.name or "").lower()
     if suffix.endswith(".csv"):
         return read_csv_smart(uploaded_file)
-    if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
+    if suffix.endswith(".xlsx"):
         return pd.read_excel(uploaded_file), None
+    if suffix.endswith(".xls"):
+        try:
+            return pd.read_excel(uploaded_file, engine="xlrd"), None
+        except Exception as e1:
+            try:
+                return pd.read_excel(uploaded_file), None
+            except Exception as e2:
+                return None, f"读取 .xls 失败（xlrd 引擎 + 默认引擎均报错）：{e1}；fallback 报错：{e2}"
     return None, "仅支持 CSV / XLSX / XLS 文件"
 
 
@@ -1046,8 +1056,12 @@ for k, default in [
 # Assets / demo root
 _PROJECT_ROOT = _os.path.dirname(_os.path.abspath(__file__))
 _ASSETS_DIR = _os.path.join(_PROJECT_ROOT, "assets")
+
+
 def _asset(p: str) -> str:
     return _os.path.join(_ASSETS_DIR, p)
+
+
 def _bytes(p: str):
     with open(p, "rb") as f:
         return f.read()

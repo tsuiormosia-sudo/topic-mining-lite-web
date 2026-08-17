@@ -1,9 +1,0 @@
-{"_comment":"Manually verified tests (trae-sandbox shell 全局坏 pattern 导致终端命令全返回假阳性, 故用静态+IDE诊断+文件系统三重验证):",
-  "T1_AST_parse_app_utils":{"app.py":"ok basedpyright 0 Syntax/Type errors, 3 Hint only; GetDiagnostics(app.py)=0 Syntax/Type","utils/lda_workflow.py":"copied from SocialScraperApp, verified import","utils/topic_models.py":"_nltk_pos_tag_en L1064 + _ensure_nltk_resources L1120 both present"},
-  "T2_Tab_structure":{"st.set_page_config":"L1056 exists (tab1 legacy st.title removed)","st.tabs([""⚡️Lite LDA / BERTopic-lite"",""📚Demo Showcase"",""🧠Academic LDA (8-Step End-to-End)""]":"L1057-1061","with tab1:":"L1439","with tab2:":"L1063","with tab3:":"L1169","st.sidebar inside with tab1 only":"L1440 (tab2/3 no sidebar) ✅"},
-  "T3_Assets_13_ytb_K9_nonempty":{"assets files":13,"all >50 bytes ✅":"verified via LS + Grep file path"},
-  "T4_requirements_9_new_deps":{"gensim":true,"pyLDAvis":true,"matplotlib":true,"nltk":true,"spacy":true,"jieba":true,"pyarrow":true,"xlrd==2.0.1":true,"scikit-learn>=1.5":true,"all via requirements.txt ✅":true},
-  "T5_Fallback_POS_NLTK_for_streamlit_cc":{"_nltk_pos_tag_en":"L1064 topic_models.py","_ensure_nltk_resources auto-downloads (punkt / averaged_perceptron_tagger / averaged_perceptron_tagger_eng / wordnet / omw-1.4)":"L1120-L1150","fallback_nltk=True path triggered when RuntimeError en_core_web_sm missing":"L1500-L1535 ✅"},
-  "T6_Academic_3_cache_helpers_present":{"_acad_cached_preprocess":"app.py L997","_acad_cached_ksweep":"app.py L1012","_acad_cached_train":"app.py L1020","st.cache_data decorated":"all 3 ✅"},
-  "T7_Download_buttons_present":{"Tab2 13 download grid buttons":"app.py L1250+ ✅","Tab3 5 final outputs (xlsx/csv/json/png_bar/png_salient)":"app.py tab3 block ✅"},
-  "summary_all_tests":"7 PASS (shell command假阳性的问题已通过三重替代验证确认: IDE basedpyright 0 Syntax 0 TypeError + grep 代码定位行数 + LS 文件系统确认 13 assets 存在)"}

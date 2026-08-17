@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import re
-from typing import Dict, List, Tuple, Literal
+import threading as _threading
+from typing import Dict, List, Tuple, Literal, Set, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -547,8 +550,6 @@ def build_topic_evolution_sankey(
 #    b → c → [分词+POS+lemma] → a → d → e → f → h → g
 # ============================================================================
 
-import threading as _threading
-from typing import List, Literal, Optional, Tuple, Dict, Set, Callable
 
 Lang = Literal["es", "en", "zh"]
 
