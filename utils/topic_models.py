@@ -93,34 +93,64 @@ def build_analysis_text(df: pd.DataFrame, text_col: str | None) -> pd.DataFrame:
         # 2) 工具函数: 把任何 Series 变成纯 str Series（NaN/None/bytes/dict/list 全部安全转 str）
         def _safe_str_series(s: pd.Series) -> pd.Series:
             try:
-                # 先 copy 避免修改原 df
                 s = s.copy()
-                # NaN / None → 空串
-                s = s.fillna("")
-                # 逐元素安全转 str (bytes 用 utf-8 decode, dict/list 直接 repr)
+                try:
+                    s = s.fillna("")
+                except Exception:
+                    pass
                 def _elem_to_str(x):
                     try:
                         if x is None:
                             return ""
-                        if isinstance(x, float):
-                            if np.isnan(x) or np.isinf(x):
+                        try:
+                            if pd.isna(x):
                                 return ""
-                            try:
-                                if x == int(x):
-                                    return str(int(x))
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
+                        try:
+                            import numbers as _numbers
+                            if isinstance(x, _numbers.Number):
+                                try:
+                                    if isinstance(x, complex):
+                                        try:
+                                            return (f"{x.real:.10g}+{x.imag:.10g}j"
+                                                    if abs(x.imag) > 1e-12 else f"{x.real:.10g}")
+                                        except Exception:
+                                            return str(x)
+                                    fv = float(x)
+                                    if not np.isfinite(fv):
+                                        return ""
+                                    try:
+                                        if abs(fv - round(fv)) < 1e-9:
+                                            iv = int(round(fv))
+                                            return str(iv)
+                                    except (OverflowError, ValueError, TypeError):
+                                        pass
+                                    try:
+                                        return f"{fv:.10g}"
+                                    except Exception:
+                                        return str(fv)
+                                except Exception:
+                                    try:
+                                        return str(x)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                         if isinstance(x, (bytes, bytearray)):
                             try:
                                 return x.decode("utf-8", errors="replace")
                             except Exception:
                                 return str(x)
-                        if isinstance(x, (dict, list, tuple, set)):
+                        if isinstance(x, (dict, list, tuple, set, frozenset)):
                             try:
                                 import json as _json
                                 return _json.dumps(x, ensure_ascii=False, default=str)
                             except Exception:
-                                return str(x)
+                                try:
+                                    return repr(x)
+                                except Exception:
+                                    return str(x)
                         return str(x)
                     except Exception:
                         try:
@@ -130,10 +160,25 @@ def build_analysis_text(df: pd.DataFrame, text_col: str | None) -> pd.DataFrame:
                 try:
                     return s.apply(_elem_to_str).astype(str).fillna("")
                 except Exception:
-                    return s.astype(str).fillna("").apply(lambda x: x if isinstance(x, str) else "")
+                    try:
+                        return s.astype(str).fillna("").apply(lambda x: x if isinstance(x, str) else "")
+                    except Exception:
+                        try:
+                            n = len(s) if s is not None and hasattr(s, '__len__') else 0
+                            idx = s.index if s is not None and hasattr(s, 'index') else range(n)
+                            return pd.Series([""] * n, index=idx)
+                        except Exception:
+                            return pd.Series([""])
             except Exception:
-                # 终极兜底: 返回全空 str Series 对齐原 index
-                return pd.Series([""] * len(s), index=s.index if s is not None and hasattr(s, 'index') else range(len(s) if s is not None else 0))
+                try:
+                    n = len(s) if s is not None and hasattr(s, '__len__') else 0
+                    idx = s.index if s is not None and hasattr(s, 'index') else range(n)
+                    return pd.Series([""] * n, index=idx)
+                except Exception:
+                    try:
+                        return pd.Series([""], index=[0])
+                    except Exception:
+                        return pd.Series([""])
 
         # 3) 明确指定 text_col: 优先用它（哪怕列名重复，前面已去重）
         if text_col and text_col in out.columns:
