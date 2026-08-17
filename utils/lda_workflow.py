@@ -130,36 +130,40 @@ def load_any_table(file_path_or_bytesio, original_name_hint=None, sheet_hint=Non
     ext = os.path.splitext(name)[1].lower()
 
     try:
+        engine = None
+        sheets = ['Sheet1']
         if ext in ('.xls',):
-            # old binary Excel, requires xlrd
             try:
-                import xlrd
+                import xlrd  # noqa: F401
             except Exception as e:
                 return None, f"{_m('xlrd==2.0.1')} — required for legacy .xls binary files (openpyxl cannot read .xls). detail: {e}"
-            xls = pd.ExcelFile(fp, engine='xlrd')
-            sheets = xls.sheet_names
+            engine = 'xlrd'
+            _xls = pd.ExcelFile(fp, engine=engine)
+            sheets = list(_xls.sheet_names)
+            del _xls
         elif ext in ('.xlsx', '.xlsm'):
-            xls = pd.ExcelFile(fp, engine='openpyxl')
-            sheets = xls.sheet_names
+            engine = 'openpyxl'
+            _xls = pd.ExcelFile(fp, engine=engine)
+            sheets = list(_xls.sheet_names)
+            del _xls
         elif ext == '.parquet':
             return pd.read_parquet(fp), None
         elif ext == '.csv':
             return pd.read_csv(fp), None
         else:
-            # fall back try csv
             try:
                 return pd.read_csv(fp), None
             except Exception as e:
                 return None, f"Unsupported extension '{ext}' (expected .xls/.xlsx/.csv/.parquet). Try convert to CSV first. detail: {e}"
 
-        # Excel type: pick largest sheet
         if sheet_hint and sheet_hint in sheets:
-            return pd.read_excel(xls, sheet_name=sheet_hint), None
+            return pd.read_excel(fp, engine=engine, sheet_name=sheet_hint), None
         best_sheet, best_score = None, -1
         for sh in sheets:
             try:
-                _df = pd.read_excel(xls, sheet_name=sh, nrows=0)
-                score = max(0, len(pd.read_excel(xls, sheet_name=sh, usecols=[0]).index)) * max(1, len(_df.columns))
+                _hdr = pd.read_excel(fp, engine=engine, sheet_name=sh, nrows=0)
+                _n_rows = len(pd.read_excel(fp, engine=engine, sheet_name=sh, usecols=[0]).index)
+                score = max(0, int(_n_rows)) * max(1, len(_hdr.columns))
             except Exception:
                 score = -1
             if score > best_score:
@@ -167,7 +171,7 @@ def load_any_table(file_path_or_bytesio, original_name_hint=None, sheet_hint=Non
                 best_sheet = sh
         if best_sheet is None:
             return None, f"No non-empty sheet found. Available sheets: {sheets}"
-        return pd.read_excel(xls, sheet_name=best_sheet), None
+        return pd.read_excel(fp, engine=engine, sheet_name=best_sheet), None
     except Exception as e:
         return None, f"load_any_table failed: {e}"
 
@@ -347,21 +351,13 @@ def run_lda_k_sweep(preprocessed_df, k_list=None, k_defaults=(3,4,5,6,7,8,9,10,1
             loglik = float(lda.score(tf))
             top_idx = np.argsort(-lda.components_, axis=1)[:, :25]
             top_words = [[feat[j] for j in row] for row in top_idx]
-            bows = None
-            if HAS_GENSIM and gensim_dct is not None:
-                try:
-                    def _row(r):
-                        ids = r.nonzero()[1]
-                        return [(int(i), int(tf[r.indices[0] if len(r.indices) else 0, i]) if False else int(tf[0, i]))
-                                for _ in [0] for i in ids]
-                    bows = []
-                    for i in range(N):
-                        r = tf[i].tocoo()
-                        bows.append(list(zip(r.col.tolist(), r.data.astype(int).tolist())))
-                except Exception:
-                    bows = None
-            coh = _coherence_scores(tokens_train, bows or [], gensim_dct, [w[:15] for w in top_words],
-                                    coherence_processes=coherence_processes) if bows is not None else {'c_v': float('nan'), 'u_mass': float('nan')}
+            # Build gensim-compatible BoW: [(token_id, count_int), ...] per doc (COO sparse expansion)
+            bows = []
+            for i in range(N):
+                r = tf[i].tocoo()
+                bows.append(list(zip(r.col.astype(int).tolist(), r.data.astype(int).tolist())))
+            coh = _coherence_scores(tokens_train, bows, gensim_dct, [w[:15] for w in top_words],
+                                    coherence_processes=coherence_processes)
             rows.append({'K': int(K), 'perplexity': perp, 'log_likelihood': loglik,
                          'coherence_cv': coh['c_v'], 'coherence_umass': coh['u_mass'],
                          'train_time_s': round(t, 3), 'N_docs_trained': int(N), 'V_vocab': int(V)})
