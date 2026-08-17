@@ -65,39 +65,179 @@ def tokenize(text: str, language: Literal["en", "zh", "mixed"] = "mixed") -> Lis
 
 
 def build_analysis_text(df: pd.DataFrame, text_col: str | None) -> pd.DataFrame:
-    out = df.copy()
-    if text_col and text_col in out.columns:
-        out["analysis_text"] = out[text_col].fillna("").astype(str)
-        return out
+    """把 text_col (或 Title+content) 合并成 analysis_text 列（每行一个 str，不丢数据不崩）。"""
+    try:
+        # 最外层兜底: 任何异常 → 返回 df copy + 空 analysis_text 列，绝不抛
+        if df is None:
+            return pd.DataFrame(columns=["analysis_text"])
+        if not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                return pd.DataFrame(columns=["analysis_text"])
+        # 1) 重复列名去重（YouTube 导出 xlsx 经常有两个 Title / Content 列）
+        #    pandas 遇到重复 columns 时 df[col] 返回 DataFrame → 会报 "Cannot set DataFrame to single column"
+        try:
+            cols = list(df.columns)
+            if len(cols) != len(set(cols)):
+                seen: Set = set()
+                keep_idx: List[int] = []
+                for i, c in enumerate(cols):
+                    if c not in seen:
+                        seen.add(c)
+                        keep_idx.append(i)
+                df = df.iloc[:, keep_idx].copy()
+        except Exception:
+            pass
+        out = df.copy()
+        # 2) 工具函数: 把任何 Series 变成纯 str Series（NaN/None/bytes/dict/list 全部安全转 str）
+        def _safe_str_series(s: pd.Series) -> pd.Series:
+            try:
+                # 先 copy 避免修改原 df
+                s = s.copy()
+                # NaN / None → 空串
+                s = s.fillna("")
+                # 逐元素安全转 str (bytes 用 utf-8 decode, dict/list 直接 repr)
+                def _elem_to_str(x):
+                    try:
+                        if x is None:
+                            return ""
+                        if isinstance(x, float):
+                            if np.isnan(x) or np.isinf(x):
+                                return ""
+                            try:
+                                if x == int(x):
+                                    return str(int(x))
+                            except Exception:
+                                pass
+                        if isinstance(x, (bytes, bytearray)):
+                            try:
+                                return x.decode("utf-8", errors="replace")
+                            except Exception:
+                                return str(x)
+                        if isinstance(x, (dict, list, tuple, set)):
+                            try:
+                                import json as _json
+                                return _json.dumps(x, ensure_ascii=False, default=str)
+                            except Exception:
+                                return str(x)
+                        return str(x)
+                    except Exception:
+                        try:
+                            return repr(x)
+                        except Exception:
+                            return ""
+                try:
+                    return s.apply(_elem_to_str).astype(str).fillna("")
+                except Exception:
+                    return s.astype(str).fillna("").apply(lambda x: x if isinstance(x, str) else "")
+            except Exception:
+                # 终极兜底: 返回全空 str Series 对齐原 index
+                return pd.Series([""] * len(s), index=s.index if s is not None and hasattr(s, 'index') else range(len(s) if s is not None else 0))
 
-    title_col = None
-    for c in ("Title", "title"):
-        if c in out.columns:
-            title_col = c
-            break
-    content_col = None
-    for c in ("content", "Content", "text", "Text"):
-        if c in out.columns:
-            content_col = c
-            break
+        # 3) 明确指定 text_col: 优先用它（哪怕列名重复，前面已去重）
+        if text_col and text_col in out.columns:
+            try:
+                col_data = out[text_col]
+                # 防御: 去重后还是 DataFrame (极端情况) → 取第 0 列
+                if isinstance(col_data, pd.DataFrame):
+                    col_data = col_data.iloc[:, 0]
+                out["analysis_text"] = _safe_str_series(col_data)
+                return out
+            except Exception:
+                try:
+                    out["analysis_text"] = _safe_str_series(out.iloc[:, 0])
+                    return out
+                except Exception:
+                    out["analysis_text"] = ""
+                    return out
 
-    if title_col is None and content_col is None:
-        out["analysis_text"] = ""
-        return out
+        # 4) 没传 text_col: 尝试 Title + Content 合并 (向量化, 不用 iterrows)
+        title_col: Optional[str] = None
+        for c in ("Title", "title", "TITLE"):
+            if c in out.columns:
+                title_col = c
+                break
+        content_col: Optional[str] = None
+        for c in ("content", "Content", "CONTENT", "text", "Text", "TEXT", "Comment", "comment"):
+            if c in out.columns:
+                content_col = c
+                break
 
-    parts = []
-    for _, row in out.iterrows():
-        t = str(row.get(title_col, "") or "").strip() if title_col else ""
-        c = str(row.get(content_col, "") or "").strip() if content_col else ""
-        if t and c:
-            if c.lower().startswith(t.lower()) or t.lower() == c.lower():
-                parts.append(c)
-            else:
-                parts.append(f"{t} {c}".strip())
-        else:
-            parts.append((t or c or "").strip())
-    out["analysis_text"] = pd.Series(parts, index=out.index).fillna("").astype(str)
-    return out
+        if title_col is None and content_col is None:
+            # 都找不到: 尝试用第 1 列 (很多导出工具把文本放在第一列但没有列名)
+            try:
+                if len(out.columns) > 0:
+                    out["analysis_text"] = _safe_str_series(out.iloc[:, 0])
+                else:
+                    out["analysis_text"] = ""
+            except Exception:
+                out["analysis_text"] = ""
+            return out
+
+        try:
+            t_series = _safe_str_series(out[title_col]) if title_col is not None else pd.Series([""] * len(out), index=out.index)
+            c_series = _safe_str_series(out[content_col]) if content_col is not None else pd.Series([""] * len(out), index=out.index)
+            # strip + 去两端空白
+            t = t_series.astype(str).fillna("").str.strip()
+            c = c_series.astype(str).fillna("").str.strip()
+
+            # 规则 1: 只有 title
+            only_t = ((c == "") & (t != ""))
+            # 规则 2: 只有 content
+            only_c = ((t == "") & (c != ""))
+            # 规则 3: 都没有 → 空串
+            both_empty = ((t == "") & (c == ""))
+            # 规则 4: 都有 → 合并 (如果 content 以 title 开头 / 二者完全相等, 取 content 去重)
+            both_have = ~(only_t | only_c | both_empty)
+
+            merged = pd.Series([""] * len(out), index=out.index, dtype=str)
+            merged[only_t] = t[only_t]
+            merged[only_c] = c[only_c]
+            merged[both_empty] = ""
+            if both_have.any():
+                try:
+                    # 逐行处理 (避免 c_low.str.startswith(t_low) TypeError: startswith expects str/tuple not Series)
+                    t_list = t[both_have].tolist()
+                    c_list = c[both_have].tolist()
+                    idx_list = t[both_have].index.tolist()
+                    merged_vals: List[str] = []
+                    for ti, ci in zip(t_list, c_list):
+                        try:
+                            tl = ti.lower() if isinstance(ti, str) else ""
+                            cl = ci.lower() if isinstance(ci, str) else ""
+                            if tl and cl and (cl.startswith(tl) or tl == cl):
+                                # content 已包含 title → 只用 content (去重)
+                                merged_vals.append((ci or "").strip())
+                            else:
+                                merged_vals.append(f"{ti or ''} {ci or ''}".strip())
+                        except Exception:
+                            merged_vals.append(f"{ti or ''} {ci or ''}".strip())
+                    merged_bh = pd.Series(merged_vals, index=idx_list, dtype=str)
+                    merged[both_have] = merged_bh
+                except Exception:
+                    # fallback: 简单拼接
+                    merged[both_have] = (t[both_have] + " " + c[both_have]).str.strip()
+            out["analysis_text"] = merged.astype(str).fillna("")
+            return out
+        except Exception:
+            # 终极兜底: 返回空 analysis_text 或 第一列
+            try:
+                if len(out.columns) > 0:
+                    out["analysis_text"] = _safe_str_series(out.iloc[:, 0])
+                else:
+                    out["analysis_text"] = ""
+                return out
+            except Exception:
+                out["analysis_text"] = ""
+                return out
+    except Exception:
+        try:
+            result = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            result["analysis_text"] = ""
+            return result
+        except Exception:
+            return pd.DataFrame(columns=["analysis_text"])
 
 
 def _detect_language_for_corpus(texts: List[str]) -> Literal["en", "zh", "mixed"]:
