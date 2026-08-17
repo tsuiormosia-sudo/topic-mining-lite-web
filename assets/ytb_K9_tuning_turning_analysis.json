@@ -1,0 +1,12 @@
+{
+  "cv_knee_K": 9,
+  "perplexity_elbow_K": 4,
+  "cv_best_K": 9,
+  "perplexity_best_K": 12,
+  "first_big_cv_jump_at_pair": [
+    6,
+    7
+  ],
+  "recommended_K_composite": 6,
+  "recommended_K_textual": "$C_V$ knee (K=9) + Perplexity elbow (K=4) composite -> recommended $K^*$=6"
+}
