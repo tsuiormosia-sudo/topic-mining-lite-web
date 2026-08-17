@@ -886,128 +886,146 @@ def _zh_traditional_to_simplified(text: str) -> str:
 # ---------------------------------------------------------------------------
 def _repair_youtube_hyphenation(text: str, lang: Lang) -> str:
     """在 (b+c) 清洗结尾再跑一次：解决 YouTube 字幕断行导致的 e xperience 类词首字母截断。"""
-    if lang not in {"en", "es"}:
-        return text
-    if not isinstance(text, str) or not text:
-        return text
+    # 最外层兜底: 任何异常返回原始字符串, 不影响其他文档预处理
+    try:
+        if lang not in {"en", "es"}:
+            return text if isinstance(text, str) else ""
+        if not isinstance(text, str):
+            return ""
+        text = text.strip()
+        if not text:
+            return text
 
-    # 先处理：单字母 (e/t/a/c/i/s/x/r) + 常见 x/ch/ce/ss/ic 开头的完整词
-    # 格式：<断词首字母> <完整词干>  ->  合并
-    #
-    # 英文 2 字母以上词干 (YouTube 字幕断词最常见的 20 个词：
-    #   experience* / experiment* / excitement* / expression* /
-    #   explanation* / excellent* / executive* / technology* /
-    #   xample / xcellent / xercise / xperience -> example / excellent / exercise / experience)
-    if lang == "en":
-        en_merges = [
-            # 1 个字母截断
-            (r"\be\s+(xperience\w*)\b",          r"e\1"),   # e xperience(s/d) -> experience(s/d)
-            (r"\be\s+(xperiment\w*)\b",          r"e\1"),   # e xperiment(s)  -> experiment(s)
-            (r"\be\s+(xcitement\w*)\b",          r"e\1"),   # e xcitement      -> excitement
-            (r"\be\s+(xpression\w*)\b",          r"e\1"),   # e xpression(s)   -> expression(s)
-            (r"\be\s+(xplanation\w*)\b",         r"e\1"),   # e xplanation(s)  -> explanation
-            (r"\be\s+(xcellent\w*)\b",           r"e\1"),   # e xcellent       -> excellent
-            (r"\be\s+(xecutive\w*)\b",           r"e\1"),   # e xecutive(s)    -> executive
-            (r"\be\s+(xercise\w*)\b",            r"e\1"),   # e xercise        -> exercise
-            (r"\be\s+(xample\w*)\b",             r"e\1"),   # e xample(s)      -> example
-            (r"\bt\s+(echnology\w*)\b",          r"t\1"),   # t echnology(ies) -> technology
-            (r"\bt\s+(emperature\w*)\b",         r"t\1"),   # t emperature(s)  -> temperature
-            (r"\bt\s+(ravel\w*)\b",              r"t\1"),   # t ravel(s/ed)    -> travel
-            (r"\bt\s+(our\w*)\b",                r"t\1"),   # t our(s)         -> tour
-            (r"\bs\s+(ervice\w*)\b",             r"s\1"),   # s ervice(s)      -> service
-            (r"\bs\s+(ystem\w*)\b",              r"s\1"),   # s ystem(s)       -> system
-            (r"\ba\s+(utomation\w*)\b",          r"a\1"),   # a utomation      -> automation
-            (r"\ba\s+(rtificial\w*)\b",          r"a\1"),   # a rtificial      -> artificial
-            (r"\bc\s+(ustomer\w*)\b",            r"c\1"),   # c ustomer(s)     -> customer
-            (r"\bc\s+(heck\w*)\b",               r"c\1"),   # c heck(s/in/out) -> check
-            (r"\bc\s+(ompan\w*)\b",              r"c\1"),   # c ompany/ies     -> company
-            (r"\bi\s+(nformation\w*)\b",         r"i\1"),   # i nformation     -> information
-            (r"\br\s+(obot\w*)\b",               r"r\1"),   # r obot(s)        -> robot
-            (r"\br\s+(eception\w*)\b",           r"r\1"),   # r eception(ist)  -> reception
-            # 少数会在 2 字母处截断
-            (r"\bex\s+(perience\w*)\b",          r"ex\1"),
-            (r"\bex\s+(periment\w*)\b",          r"ex\1"),
-            (r"\bex\s+(citement\w*)\b",          r"ex\1"),
-            (r"\bex\s+(pression\w*)\b",          r"ex\1"),
-            (r"\bex\s+(planation\w*)\b",         r"ex\1"),
-            (r"\bex\s+(cellent\w*)\b",           r"ex\1"),
-            (r"\bex\s+(ecutive\w*)\b",           r"ex\1"),
-            (r"\bex\s+(ercise\w*)\b",            r"ex\1"),
-            (r"\bex\s+(ample\w*)\b",             r"ex\1"),
-            (r"\bte\s+(chnology\w*)\b",          r"te\1"),
-            (r"\bte\s+(mperature\w*)\b",         r"te\1"),
-            (r"\bin\s+(formation\w*)\b",         r"in\1"),
-            (r"\bar\s+(tificial\w*)\b",          r"ar\1"),
-            (r"\bcus\s+(tomer\w*)\b",            r"cus\1"),
-            (r"\bser\s+(vice\w*)\b",             r"ser\1"),
-            (r"\bsys\s+(tem\w*)\b",              r"sys\1"),
-            (r"\bho\s+(spitality\w*)\b",         r"ho\1"),  # ho spitality -> hospitality
-            (r"\bho\s+(tel\w*)\b",               r"ho\1"),  # ho tel -> hotel
-        ]
-        for pat, repl in en_merges:
-            text = re.sub(pat, repl, text)
-        # 最后收尾兜底：如果还残留纯 "erience/chnology/xperience" 等独立词，补前缀
-        en_standalone_fix = {
-            "erience": "experience", "erienced": "experienced", "eriences": "experiences",
-            "eriencing": "experiencing",
-            "periment": "experiment", "periments": "experiments", "perimented": "experimented",
-            "perimenting": "experimenting",
-            "citement": "excitement",
-            "pression": "expression", "pressions": "expressions",
-            "planation": "explanation", "planations": "explanations",
-            "cellent": "excellent",
-            "cutive": "executive", "cutives": "executives",
-            "ercise": "exercise", "ercises": "exercises",
-            "ample": "example", "amples": "examples",
-            "chnology": "technology", "chnologies": "technologies", "chnological": "technological",
-            "mperature": "temperature", "mperatures": "temperatures",
-            "utomation": "automation",
-            "rtificial": "artificial",
-            "nformation": "information",
-            "eception": "reception", "eceptionist": "receptionist",
-            "ospitality": "hospitality",
-            # 2 字母断行残留
-            "xperience": "experience", "xperienced": "experienced", "xperiences": "experiences",
-            "xperiment": "experiment", "xperiments": "experiments",
-            "xcitement": "excitement",
-            "xpression": "expression", "xpressions": "expressions",
-            "xplanation": "explanation", "xplanations": "explanations",
-            "xcellent": "excellent",
-            "xecutive": "executive", "xecutives": "executives",
-            "xercise": "exercise",
-            "xample": "example",
-            "echnology": "technology", "echnologies": "technologies",
-            "emperature": "temperature",
-        }
-        def _en_patch(m):
-            w = m.group(0)
-            low = w.lower()
-            return en_standalone_fix.get(low, w)
-        text = re.sub(r"\b[a-z]{5,}\b", _en_patch, text)
+        if lang == "en":
+            en_merges = [
+                (r"\be\s+(xperience\w*)\b",          r"e\1"),
+                (r"\be\s+(xperiment\w*)\b",          r"e\1"),
+                (r"\be\s+(xcitement\w*)\b",          r"e\1"),
+                (r"\be\s+(xpression\w*)\b",          r"e\1"),
+                (r"\be\s+(xplanation\w*)\b",         r"e\1"),
+                (r"\be\s+(xcellent\w*)\b",           r"e\1"),
+                (r"\be\s+(xecutive\w*)\b",           r"e\1"),
+                (r"\be\s+(xercise\w*)\b",            r"e\1"),
+                (r"\be\s+(xample\w*)\b",             r"e\1"),
+                (r"\bt\s+(echnology\w*)\b",          r"t\1"),
+                (r"\bt\s+(emperature\w*)\b",         r"t\1"),
+                (r"\bt\s+(ravel\w*)\b",              r"t\1"),
+                (r"\bt\s+(our\w*)\b",                r"t\1"),
+                (r"\bs\s+(ervice\w*)\b",             r"s\1"),
+                (r"\bs\s+(ystem\w*)\b",              r"s\1"),
+                (r"\ba\s+(utomation\w*)\b",          r"a\1"),
+                (r"\ba\s+(rtificial\w*)\b",          r"a\1"),
+                (r"\bc\s+(ustomer\w*)\b",            r"c\1"),
+                (r"\bc\s+(heck\w*)\b",               r"c\1"),
+                (r"\bc\s+(ompan\w*)\b",              r"c\1"),
+                (r"\bi\s+(nformation\w*)\b",         r"i\1"),
+                (r"\br\s+(obot\w*)\b",               r"r\1"),
+                (r"\br\s+(eception\w*)\b",           r"r\1"),
+                (r"\bex\s+(perience\w*)\b",          r"ex\1"),
+                (r"\bex\s+(periment\w*)\b",          r"ex\1"),
+                (r"\bex\s+(citement\w*)\b",          r"ex\1"),
+                (r"\bex\s+(pression\w*)\b",          r"ex\1"),
+                (r"\bex\s+(planation\w*)\b",         r"ex\1"),
+                (r"\bex\s+(cellent\w*)\b",           r"ex\1"),
+                (r"\bex\s+(ecutive\w*)\b",           r"ex\1"),
+                (r"\bex\s+(ercise\w*)\b",            r"ex\1"),
+                (r"\bex\s+(ample\w*)\b",             r"ex\1"),
+                (r"\bte\s+(chnology\w*)\b",          r"te\1"),
+                (r"\bte\s+(mperature\w*)\b",         r"te\1"),
+                (r"\bin\s+(formation\w*)\b",         r"in\1"),
+                (r"\bar\s+(tificial\w*)\b",          r"ar\1"),
+                (r"\bcus\s+(tomer\w*)\b",            r"cus\1"),
+                (r"\bser\s+(vice\w*)\b",             r"ser\1"),
+                (r"\bsys\s+(tem\w*)\b",              r"sys\1"),
+                (r"\bho\s+(spitality\w*)\b",         r"ho\1"),
+                (r"\bho\s+(tel\w*)\b",               r"ho\1"),
+            ]
+            for pat, repl in en_merges:
+                try:
+                    text = re.sub(pat, repl, text)
+                except Exception:
+                    pass
+            en_standalone_fix = {
+                "erience": "experience", "erienced": "experienced", "eriences": "experiences",
+                "eriencing": "experiencing",
+                "periment": "experiment", "periments": "experiments", "perimented": "experimented",
+                "perimenting": "experimenting",
+                "citement": "excitement",
+                "pression": "expression", "pressions": "expressions",
+                "planation": "explanation", "planations": "explanations",
+                "cellent": "excellent",
+                "cutive": "executive", "cutives": "executives",
+                "ercise": "exercise", "ercises": "exercises",
+                "ample": "example", "amples": "examples",
+                "chnology": "technology", "chnologies": "technologies", "chnological": "technological",
+                "mperature": "temperature", "mperatures": "temperatures",
+                "utomation": "automation",
+                "rtificial": "artificial",
+                "nformation": "information",
+                "eception": "reception", "eceptionist": "receptionist",
+                "ospitality": "hospitality",
+                "xperience": "experience", "xperienced": "experienced", "xperiences": "experiences",
+                "xperiment": "experiment", "xperiments": "experiments",
+                "xcitement": "excitement",
+                "xpression": "expression", "xpressions": "expressions",
+                "xplanation": "explanation", "xplanations": "explanations",
+                "xcellent": "excellent",
+                "xecutive": "executive", "xecutives": "executives",
+                "xercise": "exercise",
+                "xample": "example",
+                "echnology": "technology", "echnologies": "technologies",
+                "emperature": "temperature",
+            }
+            def _en_patch(m):
+                try:
+                    w = m.group(0)
+                    if not isinstance(w, str):
+                        return w if isinstance(w, str) else ""
+                    low = w.lower()
+                    return en_standalone_fix.get(low, w)
+                except Exception:
+                    return m.group(0) if isinstance(m.group(0), str) else ""
+            try:
+                text = re.sub(r"\b[a-z]{5,}\b", _en_patch, text)
+            except Exception:
+                pass
 
-    else:  # es
-        es_merges = [
-            (r"\be\s+(xperiencia\w*)\b", r"e\1"),
-            (r"\bte\s+(cnolog\w*)\b", r"te\1"),
-            (r"\bi\s+(nformaci[oó]n\w*)\b", r"i\1"),
-            (r"\be\s+(xcelente\w*)\b", r"e\1"),
-        ]
-        for pat, repl in es_merges:
-            text = re.sub(pat, repl, text)
-        es_standalone_fix = {
-            "xperiencia": "experiencia", "xperiencias": "experiencias",
-            "xperiment": "experimento", "xperimentos": "experimentos",
-            "cnologia": "tecnologia", "cnologias": "tecnologias",
-            "cnología": "tecnología", "cnologías": "tecnologías",
-            "xcelente": "excelente",
-        }
-        def _es_patch(m):
-            w = m.group(0)
-            low = w.lower()
-            return es_standalone_fix.get(low, w)
-        text = re.sub(r"\b[a-zñáéíóúü]{5,}\b", _es_patch, text)
+        else:  # es
+            es_merges = [
+                (r"\be\s+(xperiencia\w*)\b", r"e\1"),
+                (r"\bte\s+(cnolog\w*)\b", r"te\1"),
+                (r"\bi\s+(nformaci[oó]n\w*)\b", r"i\1"),
+                (r"\be\s+(xcelente\w*)\b", r"e\1"),
+            ]
+            for pat, repl in es_merges:
+                try:
+                    text = re.sub(pat, repl, text)
+                except Exception:
+                    pass
+            es_standalone_fix = {
+                "xperiencia": "experiencia", "xperiencias": "experiencias",
+                "xperiment": "experimento", "xperimentos": "experimentos",
+                "cnologia": "tecnologia", "cnologias": "tecnologias",
+                "cnología": "tecnología", "cnologías": "tecnologías",
+                "xcelente": "excelente",
+            }
+            def _es_patch(m):
+                try:
+                    w = m.group(0)
+                    if not isinstance(w, str):
+                        return w if isinstance(w, str) else ""
+                    low = w.lower()
+                    return es_standalone_fix.get(low, w)
+                except Exception:
+                    return m.group(0) if isinstance(m.group(0), str) else ""
+            try:
+                text = re.sub(r"\b[a-zñáéíóúü]{5,}\b", _es_patch, text)
+            except Exception:
+                pass
 
-    return text
+        return text if isinstance(text, str) else str(text)
+    except Exception:
+        return text if isinstance(text, str) else (str(text) if text is not None else "")
 
 
 def preprocess_clean_for_spacy_multilang(text: str, lang: Lang, *, zh_t2s: bool = True) -> str:
@@ -1116,6 +1134,54 @@ def _nltk_pos_tag_en(sentence: str) -> List[Tuple[str, str, str]]:
 
 _NLTK_RES_LOCK = _threading.Lock()
 _NLTK_RES_OK = False
+_NLTK_DOWNLOAD_DIR_LOCK = _threading.Lock()
+_NLTK_DOWNLOAD_DIR_READY = None
+
+
+def _pick_nltk_download_dir() -> str:
+    """Streamlit Community Cloud 沙盒禁止写 ~/nltk_data -> 按优先级挑选一个可写目录, 并写入 os.environ['NLTK_DATA'] + nltk.path."""
+    global _NLTK_DOWNLOAD_DIR_READY
+    if _NLTK_DOWNLOAD_DIR_READY:
+        return _NLTK_DOWNLOAD_DIR_READY
+    with _NLTK_DOWNLOAD_DIR_LOCK:
+        if _NLTK_DOWNLOAD_DIR_READY:
+            return _NLTK_DOWNLOAD_DIR_READY
+        candidates = []
+        env = os.environ.get("NLTK_DATA", "").strip()
+        if env:
+            candidates.append(env)
+        candidates.extend([
+            "/tmp/nltk_data_cc",
+            os.path.join(os.path.expanduser("~"), "nltk_data"),
+            os.path.join(os.getcwd(), "nltk_data"),
+        ])
+        picked = None
+        for p in candidates:
+            try:
+                os.makedirs(p, exist_ok=True)
+                test = os.path.join(p, ".write_test")
+                with open(test, "w", encoding="utf-8") as f:
+                    f.write("ok")
+                try:
+                    os.remove(test)
+                except Exception:
+                    pass
+                picked = p
+                break
+            except Exception:
+                continue
+        if picked is None:
+            picked = candidates[-1]
+            try:
+                os.makedirs(picked, exist_ok=True)
+            except Exception:
+                pass
+        import nltk as _nltk_mod
+        if picked not in list(_nltk_mod.data.path):
+            _nltk_mod.data.path.insert(0, picked)
+        os.environ["NLTK_DATA"] = picked
+        _NLTK_DOWNLOAD_DIR_READY = picked
+        return picked
 
 
 def _ensure_nltk_resources():
@@ -1126,23 +1192,29 @@ def _ensure_nltk_resources():
         if _NLTK_RES_OK:
             return
         import nltk
-        needed = ["punkt", "averaged_perceptron_tagger", "wordnet", "averaged_perceptron_tagger_eng"]
-        for r in needed:
+        download_dir = _pick_nltk_download_dir()
+        needed = [
+            ("punkt", "tokenizers/punkt"),
+            ("averaged_perceptron_tagger", "taggers/averaged_perceptron_tagger"),
+            ("wordnet", "corpora/wordnet"),
+            ("averaged_perceptron_tagger_eng", "taggers/averaged_perceptron_tagger_eng"),
+            ("omw-1.4", "corpora/omw-1.4"),
+        ]
+        for res_name, data_path in needed:
             try:
-                nltk.data.find(f"tokenizers/{r}" if r.startswith("punkt") else
-                               (f"taggers/{r}" if r.startswith("averaged") else f"corpora/{r}"))
-            except Exception:
-                try:
-                    nltk.download(r, quiet=True)
-                except Exception:
-                    pass
-        try:
-            nltk.data.find("corpora/omw-1.4")
-        except Exception:
-            try:
-                nltk.download("omw-1.4", quiet=True)
+                nltk.data.find(data_path)
+                continue
             except Exception:
                 pass
+            try:
+                nltk.download(res_name, download_dir=download_dir, quiet=True)
+            except Exception:
+                # Try alternate URL mirror (github raw)
+                try:
+                    nltk.download(res_name, download_dir=download_dir, quiet=True,
+                                  raise_on_error=True)
+                except Exception:
+                    pass
         _NLTK_RES_OK = True
 
 
